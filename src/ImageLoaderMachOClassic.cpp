@@ -43,6 +43,7 @@
 #include <sys/sysctl.h>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSCacheControl.h>
+#include <mach-o/dyld_images.h>
 
 #if __x86_64__
 	#include <mach-o/x86_64/reloc.h>
@@ -52,7 +53,6 @@
 #endif
 
 #include "ImageLoaderMachOClassic.h"
-#include "mach-o/dyld_images.h"
 
 // in dyldStartup.s
 extern "C" void stub_binding_helper_i386_old();
@@ -167,11 +167,6 @@ ImageLoaderMachOClassic* ImageLoaderMachOClassic::instantiateFromFile(const char
 
 		// make sure path is stable before recording in dyld_all_image_infos
 		image->setMapped(context);
-
-		// pre-fetch content of __DATA segment for faster launches
-		// don't do this on prebound images or if prefetching is disabled
-        if ( !context.preFetchDisabled && !image->isPrebindable())
-			image->preFetchDATA(fd, offsetInFat, context);
 
 	}
 	catch (...) {
@@ -336,41 +331,6 @@ void ImageLoaderMachOClassic::setSymbolTableInfo(const macho_nlist* symbols, con
 	fDynamicInfo = dynSym;
 }
 
-void ImageLoaderMachOClassic::prefetchLINKEDIT(const LinkContext& context)
-{
-	// always prefetch a subrange of __LINKEDIT pages
-	uintptr_t symbolTableStart = (uintptr_t)fSymbolTable;
-	uintptr_t stringTableStart = (uintptr_t)fStrings;
-	uintptr_t start;
-	// if image did not load at preferred address
-	if ( segPreferredLoadAddress(0) != (uintptr_t)fMachOData ) {
-		// local relocations will be processed, so start pre-fetch at local symbols
-		start = (uintptr_t)fMachOData + fDynamicInfo->locreloff;
-	}
-	else {
-		// otherwise start pre-fetch at global symbols section of symbol table
-		start = symbolTableStart + fDynamicInfo->iextdefsym * sizeof(macho_nlist);
-	}
-	// prefetch ends at end of last undefined string in string pool
-	uintptr_t end = stringTableStart;
-	if ( fDynamicInfo->nundefsym != 0 )
-		end += fSymbolTable[fDynamicInfo->iundefsym+fDynamicInfo->nundefsym-1].n_un.n_strx;
-	else if ( fDynamicInfo->nextdefsym != 0 )
-		end += fSymbolTable[fDynamicInfo->iextdefsym+fDynamicInfo->nextdefsym-1].n_un.n_strx;
-		
-	// round to whole pages
-	start = dyld_page_trunc(start);
-	end = dyld_page_round(end);
-	
-	// skip if there is only one page
-	if ( (end-start) > dyld_page_size ) {
-		madvise((void*)start, end-start, MADV_WILLNEED);
-		fgTotalBytesPreFetched += (end-start);
-		if ( context.verboseMapping ) {
-			dyld::log("%18s prefetching 0x%0lX -> 0x%0lX\n", "__LINKEDIT", start, end-1);
-		}
-	}
-}
 
 
 #if SPLIT_SEG_DYLIB_SUPPORT	
@@ -767,11 +727,7 @@ void ImageLoaderMachOClassic::rebase(const LinkContext& context, uintptr_t slide
 {
 	CRSetCrashLogMessage2(this->getPath());
 	const uintptr_t relocBase = this->getRelocBase();
-	
-	// prefetch any LINKEDIT pages needed
-	if ( !context.preFetchDisabled && !this->isPrebindable())
-		this->prefetchLINKEDIT(context);
-	
+
 	// loop through all local (internal) relocation records
 	const relocation_info* const relocsStart = (struct relocation_info*)(&fLinkEditBase[fDynamicInfo->locreloff]);
 	const relocation_info* const relocsEnd = &relocsStart[fDynamicInfo->nlocrel];
@@ -1278,7 +1234,7 @@ void ImageLoaderMachOClassic::doBindExternalRelocations(const LinkContext& conte
 							lastUndefinedSymbol = undefinedSymbol;
 							symbolAddrCached = false;
 						}
-						if ( context.verboseBind ) {
+						if ( context.verboseBind && (undefinedSymbol != NULL) ) {
 							const char *path = NULL;
 							if ( image != NULL ) {
 								path = image->getShortName();
@@ -1395,7 +1351,8 @@ uintptr_t ImageLoaderMachOClassic::doBindFastLazySymbol(uint32_t lazyBindingInfo
 	throw "compressed LINKEDIT lazy binder called with classic LINKEDIT";
 }
 
-uintptr_t ImageLoaderMachOClassic::doBindLazySymbol(uintptr_t* lazyPointer, const LinkContext& context)
+uintptr_t ImageLoaderMachOClassic::doBindLazySymbol(uintptr_t* lazyPointer, const LinkContext& context,
+													DyldSharedCache::DataConstLazyScopedWriter& patcher)
 {
 	// scan for all lazy-pointer sections
 	const bool twoLevel = this->usesTwoLevelNameSpace();
@@ -1672,6 +1629,7 @@ void ImageLoaderMachOClassic::updateUsesCoalIterator(CoalIterator& it, uintptr_t
 						if ( ((sect->flags & S_ATTR_SELF_MODIFYING_CODE) ==0) || (sect->reserved2 != 5) )
 							continue;
 						elementSize = 5;
+                        [[clang::fallthrough]];
 				#endif
 					case S_NON_LAZY_SYMBOL_POINTERS:
 					case S_LAZY_SYMBOL_POINTERS:
@@ -1805,7 +1763,7 @@ void ImageLoaderMachOClassic::bindIndirectSymbolPointers(const LinkContext& cont
 								}
 								uintptr_t symbolAddr = resolveUndefined(context, sym, twoLevel, dontCoalesce, false, &image);
 								// update pointer
-								symbolAddr = this->bindIndirectSymbol((uintptr_t*)ptrToBind, sect, &fStrings[sym->n_un.n_strx], symbolAddr, image,  context);
+								this->bindIndirectSymbol((uintptr_t*)ptrToBind, sect, &fStrings[sym->n_un.n_strx], symbolAddr, image,  context);
 								// update stats
 								++fgTotalBindFixups;
 							}
@@ -1895,7 +1853,7 @@ void ImageLoaderMachOClassic::initializeLazyStubs(const LinkContext& context)
 #endif // __i386__
 
 
-void ImageLoaderMachOClassic::doBind(const LinkContext& context, bool forceLazysBound)
+void ImageLoaderMachOClassic::doBind(const LinkContext& context, bool forceLazysBound, const ImageLoader* reExportParent)
 {
 	CRSetCrashLogMessage2(this->getPath());
 #if __i386__
@@ -1937,7 +1895,7 @@ void ImageLoaderMachOClassic::doBind(const LinkContext& context, bool forceLazys
 	CRSetCrashLogMessage2(NULL);
 }
 
-void ImageLoaderMachOClassic::doBindJustLazies(const LinkContext& context)
+void ImageLoaderMachOClassic::doBindJustLazies(const LinkContext& context, DyldSharedCache::DataConstLazyScopedWriter& patcher)
 {
 	// some API called requested that all lazy pointers in this image be force bound
 	this->bindIndirectSymbolPointers(context, false, true);

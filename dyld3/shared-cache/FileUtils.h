@@ -36,6 +36,7 @@
 #include <dispatch/dispatch.h>
 
 #include "DyldSharedCache.h"
+#include "JSON.h"
 
 class Diagnostics;
 
@@ -73,9 +74,6 @@ bool safeSave(const void* buffer, size_t bufferLen, const std::string& path);
 
 const void* mapFileReadOnly(const char* path, size_t& mappedSize);
 
-bool isProtectedBySIP(const std::string& path);
-bool isProtectedBySIP(int fd);
-
 bool fileExists(const std::string& path);
 
 std::unordered_map<std::string, uint32_t> parseOrderFile(const std::string& orderFileData);
@@ -89,6 +87,7 @@ std::string realFilePath(const std::string& path);
 
 std::string toolDir();
 
+#if BUILDING_CACHE_BUILDER
 class SymlinkResolver {
 public:
     SymlinkResolver() { }
@@ -105,5 +104,7 @@ private:
     std::set<std::string> filePaths;
     std::map<std::string, std::string> symlinks;
 };
+#endif  // BUILDING_CACHE_BUILDER
+
 
 #endif // FileUtils_h

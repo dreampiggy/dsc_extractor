@@ -34,6 +34,8 @@
 #include <mach/shared_region.h>
 #include <mach-o/loader.h> 
 #include <mach-o/nlist.h> 
+#include <mach-o/dyld_images.h>
+#include <mach-o/dyld_priv.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <TargetConditionals.h>
@@ -41,17 +43,21 @@
 #include <new>
 #include <uuid/uuid.h>
 
+#if !TARGET_OS_DRIVERKIT && (BUILDING_LIBDYLD || BUILDING_DYLD)
+  #include <CrashReporterClient.h>
+#else
+  #define CRSetCrashLogMessage(x)
+  #define CRSetCrashLogMessage2(x)
+#endif
+
+#include "DyldSharedCache.h"
+#include "Map.h"
+#include "PointerAuth.h"
+
 #if __arm__
  #include <mach/vm_page_size.h>
 #endif
 
-#if __x86_64__ || __i386__
-	#include <CrashReporterClient.h>
-#else
-	// work around until iOS has CrashReporterClient.h
-	#define CRSetCrashLogMessage(x)
-	#define CRSetCrashLogMessage2(x)
-#endif
 
 #ifndef SHARED_REGION_BASE_ARM64
 	#define SHARED_REGION_BASE_ARM64 0x7FFF80000000LL
@@ -64,74 +70,36 @@
 
 #define LOG_BINDINGS 0
 
-#include "mach-o/dyld_images.h"
-#include "mach-o/dyld_priv.h"
-#include "DyldSharedCache.h"
 
-#if __i386__
-	#define SHARED_REGION_BASE SHARED_REGION_BASE_I386
-	#define SHARED_REGION_SIZE SHARED_REGION_SIZE_I386
-#elif __x86_64__
-	#define SHARED_REGION_BASE SHARED_REGION_BASE_X86_64
-	#define SHARED_REGION_SIZE SHARED_REGION_SIZE_X86_64
-#elif __arm__
-	#define SHARED_REGION_BASE SHARED_REGION_BASE_ARM
-	#define SHARED_REGION_SIZE SHARED_REGION_SIZE_ARM
-#elif __arm64__
-	#define SHARED_REGION_BASE SHARED_REGION_BASE_ARM64
-	#define SHARED_REGION_SIZE SHARED_REGION_SIZE_ARM64
-#endif
-
-#ifndef EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER
-	#define EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER 0x10
-#endif
-#ifndef EXPORT_SYMBOL_FLAGS_REEXPORT
-	#define EXPORT_SYMBOL_FLAGS_REEXPORT 0x08
-#endif
-
-#ifndef LC_MAIN
-	#define LC_MAIN (0x28|LC_REQ_DYLD) /* replacement for LC_UNIXTHREAD */
-	struct entry_point_command {
-		uint32_t  cmd;	/* LC_MAIN only used in MH_EXECUTE filetypes */
-		uint32_t  cmdsize;	/* 24 */
-		uint64_t  entryoff;	/* file (__TEXT) offset of main() */
-		uint64_t  stacksize;/* if not zero, initial stack size */
-	};
-#endif
-
-#if __IPHONE_OS_VERSION_MIN_REQUIRED          
+#if TARGET_OS_IPHONE
 	#define SPLIT_SEG_SHARED_REGION_SUPPORT 0
 	#define SPLIT_SEG_DYLIB_SUPPORT			0
 	#define PREBOUND_IMAGE_SUPPORT			__arm__
 	#define TEXT_RELOC_SUPPORT				__i386__
 	#define SUPPORT_OLD_CRT_INITIALIZATION	0
 	#define SUPPORT_LC_DYLD_ENVIRONMENT		1
-	#define SUPPORT_VERSIONED_PATHS			1
+	#define SUPPORT_VERSIONED_PATHS			0
 	#define SUPPORT_CLASSIC_MACHO			__arm__
 	#define SUPPORT_ZERO_COST_EXCEPTIONS	(!__USING_SJLJ_EXCEPTIONS__)
 	#define INITIAL_IMAGE_COUNT				150
-	#define SUPPORT_ACCELERATE_TABLES		!TARGET_IPHONE_SIMULATOR
-	#define SUPPORT_ROOT_PATH				TARGET_IPHONE_SIMULATOR
-	#define USES_CHAINED_BINDS				(__arm64e__)
+	#define SUPPORT_ACCELERATE_TABLES		0
+	#define SUPPORT_ROOT_PATH				TARGET_OS_SIMULATOR
 #else
 	#define SPLIT_SEG_SHARED_REGION_SUPPORT 0
 	#define SPLIT_SEG_DYLIB_SUPPORT			__i386__
 	#define PREBOUND_IMAGE_SUPPORT			__i386__
 	#define TEXT_RELOC_SUPPORT				__i386__
 	#define SUPPORT_OLD_CRT_INITIALIZATION	__i386__
-	#define SUPPORT_LC_DYLD_ENVIRONMENT		(__i386__ || __x86_64__)
+	#define SUPPORT_LC_DYLD_ENVIRONMENT		1
 	#define SUPPORT_VERSIONED_PATHS			1
 	#define SUPPORT_CLASSIC_MACHO			1
 	#define SUPPORT_ZERO_COST_EXCEPTIONS	1
 	#define INITIAL_IMAGE_COUNT				200
 	#define SUPPORT_ACCELERATE_TABLES		0
 	#define SUPPORT_ROOT_PATH				1
-	#define USES_CHAINED_BINDS				0
 #endif
 
 #define MAX_MACH_O_HEADER_AND_LOAD_COMMANDS_SIZE (32*1024)
-
-#define MH_HAS_OBJC			0x40000000
 
 
 // <rdar://problem/13590567> optimize away dyld's initializers
@@ -189,6 +157,7 @@ extern "C" 	void* xmmap(void* addr, size_t len, int prot, int flags, int fd, off
 #endif
 
 
+#define DYLD_PACKED_VERSION(major, minor, tiny) ((((major) & 0xffff) << 16) | (((minor) & 0xff) << 8) | ((tiny) & 0xff))
 
 struct ProgramVars
 {
@@ -200,6 +169,18 @@ struct ProgramVars
 };
 
 
+
+enum dyld_image_states
+{
+	dyld_image_state_mapped					= 10,		// No batch notification for this
+	dyld_image_state_dependents_mapped		= 20,		// Only batch notification for this
+	dyld_image_state_rebased				= 30,
+	dyld_image_state_bound					= 40,
+	dyld_image_state_dependents_initialized	= 45,		// Only single notification for this
+	dyld_image_state_initialized			= 50,
+	dyld_image_state_terminated				= 60		// Only single notification for this
+};
+typedef const char* (*dyld_image_state_change_handler)(enum dyld_image_states state, uint32_t infoCount, const struct dyld_image_info info[]);
 
 //
 // ImageLoader is an abstract base class.  To support loading a particular executable
@@ -263,9 +244,17 @@ public:
 	};
 
 	typedef void (^CoalesceNotifier)(const Symbol* implSym, const ImageLoader* implIn, const mach_header* implMh);
+
+    struct HashCString {
+        static size_t hash(const char* v);
+    };
+
+    struct EqualCString {
+        static bool equal(const char* s1, const char* s2);
+    };
 	
 	struct LinkContext {
-		ImageLoader*	(*loadLibrary)(const char* libraryName, bool search, const char* origin, const RPathChain* rpaths, bool enforceIOSMac, unsigned& cacheIndex);
+		ImageLoader*	(*loadLibrary)(const char* libraryName, bool search, const char* origin, const RPathChain* rpaths, unsigned& cacheIndex);
 		void			(*terminationRecorder)(ImageLoader* image);
 		bool			(*flatExportFinder)(const char* name, const Symbol** sym, const ImageLoader** image);
 		bool			(*coalescedExportFinder)(const char* name, const Symbol** sym, const ImageLoader** image, CoalesceNotifier);
@@ -312,6 +301,10 @@ public:
 		size_t			dynamicInterposeCount;
 		PrebindMode		prebindUsage;
 		SharedRegionMode sharedRegionMode;
+		mutable dyld3::Map<const char*, std::pair<const ImageLoader*, uintptr_t>, HashCString, EqualCString> weakDefMap;
+		mutable bool	weakDefMapInitialized = false;
+		mutable bool	weakDefMapProcessedLaunchDefs = false;
+		mutable bool	useNewWeakBind = false;
 		bool			dyldLoadedAtSameAddressNeededBySharedCache;
 		bool			strictMachORequired;
 		bool			allowAtPaths;
@@ -320,14 +313,16 @@ public:
 		bool			allowEnvVarsSharedCache;
 		bool			allowClassicFallbackPaths;
 		bool			allowInsertFailures;
+		bool			allowInterposing;
 		bool			mainExecutableCodeSigned;
-		bool			preFetchDisabled;
 		bool			prebinding;
 		bool			bindFlat;
 		bool			linkingMainExecutable;
 		bool			startedInitializingMainExecutable;
-#if __MAC_OS_X_VERSION_MIN_REQUIRED
-		bool			marzipan;
+#if TARGET_OS_OSX
+		bool			iOSonMac;
+		// dyld doesn't build for driverKit, so we use the macOS define to control whether driverKit is supported
+		bool			driverKit;
 #endif
 		bool			verboseOpts;
 		bool			verboseEnv;
@@ -370,8 +365,8 @@ public:
 	
 	struct UninitedUpwards
 	{
-		uintptr_t	 count;
-		ImageLoader* images[1];
+		uintptr_t	 						 count;
+		std::pair<ImageLoader*, const char*> imagesAndPaths[1];
 	};
 
 	
@@ -536,7 +531,8 @@ public:
 	virtual bool						forceFlat() const = 0;
 	
 										// called at runtime when a lazily bound function is first called
-	virtual uintptr_t					doBindLazySymbol(uintptr_t* lazyPointer, const LinkContext& context) = 0;
+	virtual uintptr_t					doBindLazySymbol(uintptr_t* lazyPointer, const LinkContext& context,
+													     DyldSharedCache::DataConstLazyScopedWriter& patcher) = 0;
 	
 										// called at runtime when a fast lazily bound function is first called
 	virtual uintptr_t					doBindFastLazySymbol(uint32_t lazyBindingInfoOffset, const LinkContext& context,
@@ -618,12 +614,14 @@ public:
 
 	virtual bool						usesChainedFixups() const { return false; }
 
-
+	virtual void						makeDataReadOnly() const {}
+	
 										// when resolving symbols look in subImage if symbol can't be found
 	void								reExport(ImageLoader* subImage);
 
-	virtual void						recursiveBind(const LinkContext& context, bool forceLazysBound, bool neverUnload);
-	virtual void						recursiveBindWithAccounting(const LinkContext& context, bool forceLazysBound, bool neverUnload);
+	virtual void						recursiveBind(const LinkContext& context, bool forceLazysBound, bool neverUnload, const ImageLoader* parent);
+	void								recursiveBindWithAccounting(const LinkContext& context, bool forceLazysBound, bool neverUnload);
+	void								recursiveRebaseWithAccounting(const LinkContext& context);
 	void								weakBind(const LinkContext& context);
 
 	void								applyInterposing(const LinkContext& context);
@@ -651,10 +649,15 @@ public:
 	void								setNeverUnload() { fNeverUnload = true; fLeaveMapped = true; }
 	void								setNeverUnloadRecursive();
 	
+	void								forEachReExportDependent( void (^callback)(const ImageLoader*, bool& stop)) const;
+
 	bool								isReferencedDownward() { return fIsReferencedDownward; }
 
+	virtual void						recursiveMakeDataReadOnly(const LinkContext& context);
+
 	virtual uintptr_t					resolveWeak(const LinkContext& context, const char* symbolName, bool weak_import, bool runResolver,
-													const ImageLoader** foundIn) { return 0; } 
+													const ImageLoader** foundIn,
+													DyldSharedCache::DataConstLazyScopedWriter& patcher) { return 0; } 
 
 										// triggered by DYLD_PRINT_STATISTICS to write info on work done and how fast
 	static void							printStatistics(unsigned int imageCount, const InitializerTimingList& timingInfo);
@@ -690,15 +693,18 @@ public:
 			void						markNotUsed() { fMarkedInUse = false; }
 			void						markedUsedRecursive(const std::vector<DynamicReference>&);
 			bool						isMarkedInUse() const	{ return fMarkedInUse; }
-		
+
 			void						setAddFuncNotified() { fAddFuncNotified = true; }
 			bool						addFuncNotified() const { return fAddFuncNotified; }
 	
+			void						setObjCMappedNotified() { fObjCMappedNotified = true; }
+			bool						objCMappedNotified() const { return fObjCMappedNotified; }
+
 	struct InterposeTuple { 
-		uintptr_t		replacement; 
-		ImageLoader*	neverImage;			// don't apply replacement to this image
-		ImageLoader*	onlyImage;			// only apply replacement to this image
-		uintptr_t		replacee; 
+		uintptr_t										replacement;
+		dyld3::AuthenticatedValue<const ImageLoader*>	neverImage;		// don't apply replacement to this image
+		dyld3::AuthenticatedValue<const ImageLoader*>	onlyImage;		// only apply replacement to this image
+		uintptr_t										replacee;
 	};
 
 	static uintptr_t read_uleb128(const uint8_t*& p, const uint8_t* end);
@@ -751,7 +757,8 @@ protected:
 						// To link() an image, its dependent libraries are loaded, it is rebased, bound, and initialized.
 						// These methods do the above, exactly once, and it the right order
 	virtual void		recursiveLoadLibraries(const LinkContext& context, bool preflightOnly, const RPathChain& loaderRPaths, const char* loadPath);
-	virtual unsigned 	recursiveUpdateDepth(unsigned int maxDepth);
+	virtual unsigned 	recursiveUpdateDepth(unsigned int maxDepth, dyld3::Array<ImageLoader*>& danglingUpwards);
+	virtual unsigned 	updateDepth(unsigned int maxDepth);
 	virtual void		recursiveRebase(const LinkContext& context);
 	virtual void		recursiveApplyInterposing(const LinkContext& context);
 	virtual void		recursiveGetDOFSections(const LinkContext& context, std::vector<DOFInfo>& dofs);
@@ -768,10 +775,10 @@ protected:
 	virtual void				doRebase(const LinkContext& context) = 0;
 	
 								// do any symbolic fix ups in this image
-	virtual void				doBind(const LinkContext& context, bool forceLazysBound) = 0;
+	virtual void				doBind(const LinkContext& context, bool forceLazysBound, const ImageLoader* reExportParent) = 0;
 	
 								// called later via API to force all lazy pointer to be bound
-	virtual void				doBindJustLazies(const LinkContext& context) = 0;
+	virtual void				doBindJustLazies(const LinkContext& context, DyldSharedCache::DataConstLazyScopedWriter& patcher) = 0;
 	
 								// if image has any dtrace DOF sections, append them to list to be registered
 	virtual void				doGetDOFSections(const LinkContext& context, std::vector<DOFInfo>& dofs) = 0;
@@ -803,7 +810,7 @@ protected:
 								// in mach-o a parent library knows name of sub libraries it re-exports..
 	virtual	bool				hasSubLibrary(const LinkContext& context, const ImageLoader* child) const  = 0;
 
-	virtual bool				weakSymbolsBound(unsigned index) { return fWeakSymbolsBound; }
+	virtual bool				weakSymbolsBound(unsigned index) const { return fWeakSymbolsBound; }
 	virtual void				setWeakSymbolsBound(unsigned index) { fWeakSymbolsBound = true; }
 
 								// set fState to dyld_image_state_memory_mapped
@@ -829,7 +836,6 @@ protected:
 	static uint32_t				fgTotalSegmentsMapped;
 	static uint32_t				fgSymbolTrieSearchs;
 	static uint64_t				fgTotalBytesMapped;
-	static uint64_t				fgTotalBytesPreFetched;
 	static uint64_t				fgTotalLoadLibrariesTime;
 public:
 	static uint64_t				fgTotalObjCSetupTime;
@@ -844,6 +850,9 @@ public:
 protected:
 	static std::vector<InterposeTuple>	fgInterposingTuples;
 	
+#if __x86_64__
+	const char*                 fAotPath;
+#endif
 	const char*					fPath;
 	const char*					fRealPath;
 	dev_t						fDevice;
@@ -867,28 +876,39 @@ private:
 	void						processInitializers(const LinkContext& context, mach_port_t this_thread,
 													InitializerTimingList& timingInfo, ImageLoader::UninitedUpwards& ups);
 
+	void						weakBindOld(const LinkContext& context);
+
 
 	recursive_lock*				fInitializerRecursiveLock;
-	uint16_t					fDepth;
-	uint16_t					fLoadOrder;
-	uint32_t					fState : 8,
-								fLibraryCount : 10,
-								fAllLibraryChecksumsAndLoadAddressesMatch : 1,
-								fLeaveMapped : 1,		// when unloaded, leave image mapped in cause some other code may have pointers into it
-								fNeverUnload : 1,		// image was statically loaded by main executable
-								fHideSymbols : 1,		// ignore this image's exported symbols when linking other images
-								fMatchByInstallName : 1,// look at image's install-path not its load path
-								fInterposed : 1,
-								fRegisteredDOF : 1,
-								fAllLazyPointersBound : 1,
-								fMarkedInUse : 1,
-								fBeingRemoved : 1,
-								fAddFuncNotified : 1,
-								fPathOwnedByImage : 1,
-								fIsReferencedDownward : 1,
-								fWeakSymbolsBound : 1;
+	union {
+		struct {
+			uint16_t					fLoadOrder;
+			uint16_t					fDepth : 15,
+										fObjCMappedNotified : 1;
+			uint32_t					fState : 8,
+										fLibraryCount : 9,
+										fMadeReadOnly : 1,
+										fAllLibraryChecksumsAndLoadAddressesMatch : 1,
+										fLeaveMapped : 1,		// when unloaded, leave image mapped in cause some other code may have pointers into it
+										fNeverUnload : 1,		// image was statically loaded by main executable
+										fHideSymbols : 1,		// ignore this image's exported symbols when linking other images
+										fMatchByInstallName : 1,// look at image's install-path not its load path
+										fInterposed : 1,
+										fRegisteredDOF : 1,
+										fAllLazyPointersBound : 1,
+										fMarkedInUse : 1,
+										fBeingRemoved : 1,
+										fAddFuncNotified : 1,
+										fPathOwnedByImage : 1,
+										fIsReferencedDownward : 1,
+										fWeakSymbolsBound : 1;
+		};
+		uint64_t 						sizeOfData;
+	};
+	static_assert(sizeof(sizeOfData) == 8, "Bad data size");
 
 	static uint16_t				fgLoadOrdinal;
+
 };
 
 

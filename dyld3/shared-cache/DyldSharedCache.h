@@ -25,22 +25,36 @@
 #ifndef DyldSharedCache_h
 #define DyldSharedCache_h
 
+#include <TargetConditionals.h>
+#include <uuid/uuid.h>
+
+#if (BUILDING_LIBDYLD || BUILDING_DYLD)
+#include <sys/types.h>
+#endif
+
+#if !(BUILDING_LIBDYLD || BUILDING_DYLD)
 #include <set>
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include <uuid/uuid.h>
+#include <unordered_set>
+#endif
 
 #include "dyld_cache_format.h"
 #include "Diagnostics.h"
 #include "MachOAnalyzer.h"
 #include "Closure.h"
+#include "JSON.h"
 
+namespace objc_opt {
+struct objc_opt_t;
+}
 
 class VIS_HIDDEN DyldSharedCache
 {
 public:
 
+#if BUILDING_CACHE_BUILDER
     enum CodeSigningDigestMode
     {
         SHA256only = 0,
@@ -48,15 +62,22 @@ public:
         Agile      = 2
     };
 
+    enum class LocalSymbolsMode {
+        keep,
+        unmap,
+        strip
+    };
+
     struct CreateOptions
     {
         std::string                                 outputFilePath;
         std::string                                 outputMapFilePath;
-        std::string                                 archName;
+        const dyld3::GradedArchs*                   archs;
         dyld3::Platform                             platform;
-        bool                                        excludeLocalSymbols;
+        LocalSymbolsMode                            localSymbolMode;
         bool                                        optimizeStubs;
-        bool                                        optimizeObjC;
+        bool                                        optimizeDyldDlopens;
+        bool                                        optimizeDyldLaunches;
         CodeSigningDigestMode                       codeSigningDigestMode;
         bool                                        dylibsRemovedDuringMastering;
         bool                                        inodesAreSameAsRuntime;
@@ -67,7 +88,7 @@ public:
         bool                                        evictLeafDylibsOnOverflow;
         std::unordered_map<std::string, unsigned>   dylibOrdering;
         std::unordered_map<std::string, unsigned>   dirtyDataSegmentOrdering;
-        std::vector<std::string>                    pathPrefixes;
+        dyld3::json::Node                           objcOptimizations;
         std::string                                 loggingPrefix;
     };
 
@@ -108,7 +129,9 @@ public:
 
     // This function verifies the set of dylibs that will go into the cache are self contained.  That the depend on no dylibs
     // outset the set.  It will call back the loader function to try to find any mising dylibs.
-    static bool verifySelfContained(std::vector<MappedMachO>& dylibsToCache, MappedMachO (^loader)(const std::string& runtimePath), std::vector<std::pair<DyldSharedCache::MappedMachO, std::set<std::string>>>& excluded);
+    static bool verifySelfContained(std::vector<MappedMachO>& dylibsToCache,
+                                    std::unordered_set<std::string>& badZippered,
+                                    MappedMachO (^loader)(const std::string& runtimePath, Diagnostics& diag), std::vector<std::pair<DyldSharedCache::MappedMachO, std::set<std::string>>>& excluded);
 
 
     //
@@ -132,16 +155,19 @@ public:
     //         errorMessage: the string describing why the cache could not be created
     //         warnings:     all warning messsages generated before the failure
     //
-    static CreateResults create(const CreateOptions&             options,
-                                const std::vector<MappedMachO>&  dylibsToCache,
-                                const std::vector<MappedMachO>&  otherOsDylibs,
-                                const std::vector<MappedMachO>&  osExecutables);
+    static CreateResults create(const CreateOptions&               options,
+                                const dyld3::closure::FileSystem&  fileSystem,
+                                const std::vector<MappedMachO>&    dylibsToCache,
+                                const std::vector<MappedMachO>&    otherOsDylibs,
+                                const std::vector<MappedMachO>&    osExecutables);
 
 
     //
     // Returns a text "map" file as a big string
     //
     std::string         mapFile() const;
+
+#endif // BUILDING_CACHE_BUILDER
 
 
     //
@@ -169,6 +195,30 @@ public:
 
 
     //
+    // Is this path (which we know is in the shared cache), overridable
+    //
+    bool                isOverridablePath(const char* dylibPath) const;
+
+
+    //
+    // Path is to a dylib in the cache and this is an optimized cache so that path cannot be overridden
+    //
+    bool                hasNonOverridablePath(const char* dylibPath) const;
+
+
+    //
+    // Check if shared cache contains local symbols info
+    //
+    const bool          hasLocalSymbolsInfo() const;
+
+
+    //
+    // Get code signature mapped address
+    //
+    uint64_t             getCodeSignAddress() const;
+
+
+    //
     // Searches cache for dylib with specified mach_header
     //
     bool                findMachHeaderImageIndex(const mach_header* mh, uint32_t& imageIndex) const;
@@ -180,13 +230,29 @@ public:
 
 
     //
-    // Iterates over each dylib in the cache
+    // Get image entry from index
     //
     const mach_header*  getIndexedImageEntry(uint32_t index, uint64_t& mTime, uint64_t& node) const;
 
 
+    // iterates over all dylibs and aliases
+    void forEachDylibPath(void (^handler)(const char* dylibPath, uint32_t index)) const;
+
+
     //
-    // Iterates over each dylib in the cache
+    // Get image path from index
+    //
+    const char*         getIndexedImagePath(uint32_t index) const;
+
+#if BUILDING_LIBDYLD
+    //
+    // Get the canonical (dylib) path for a given path, which may be a symlink to something in the cache
+    //
+    const char*         getCanonicalPath(const char* path) const;
+#endif
+
+    //
+    // Iterates over each text segment in the cache
     //
     void                forEachImageTextSegment(void (^handler)(uint64_t loadAddressUnslid, uint64_t textSegmentSize, const uuid_t dylibUUID, const char* installName, bool& stop)) const;
 
@@ -194,14 +260,48 @@ public:
     //
     // Iterates over each of the three regions in the cache
     //
-    void                forEachRegion(void (^handler)(const void* content, uint64_t vmAddr, uint64_t size, uint32_t permissions)) const;
+    void                forEachRegion(void (^handler)(const void* content, uint64_t vmAddr, uint64_t size,
+                                                      uint32_t initProt, uint32_t maxProt, uint64_t flags)) const;
 
+
+    //
+    // Get local symbols nlist entries
+    //
+    const void*         getLocalNlistEntries() const;
+
+
+    //
+    // Get local symbols nlist count
+    //
+    const uint32_t      getLocalNlistCount() const;
+
+
+    //
+    // Get local symbols strings
+    //
+    const char*  getLocalStrings() const;
+
+
+    //
+    // Get local symbols strings size
+    //
+    const uint32_t       getLocalStringsSize() const;
+
+
+     //
+     // Iterates over each local symbol entry in the cache
+     //
+     void                forEachLocalSymbolEntry(void (^handler)(uint32_t dylibOffset, uint32_t nlistStartIndex, uint32_t nlistCount, bool& stop)) const;
 
     //
     // Returns if an address range is in this cache, and if so if in a read-only area
     //
     bool                inCache(const void* addr, size_t length, bool& readOnly) const;
 
+    //
+    // Returns true if a path is an alternate path (symlink)
+    //
+    bool isAlias(const char* path) const;
 
     //
     // returns address the cache would load at if unslid
@@ -256,15 +356,152 @@ public:
     //
     const dyld3::closure::Image* findDlopenOtherImage(const char* path) const;
 
+    //
+    // Returns the pointer to the slide info for this cache
+    //
+    const dyld_cache_slide_info* legacyCacheSlideInfo() const;
+
+    //
+    // Returns a pointer to the __DATA region mapping in the cache
+    //
+    const dyld_cache_mapping_info* legacyCacheDataRegionMapping() const;
+
+    //
+    // Returns a pointer to the start of the __DATA region in the cache
+    //
+    const uint8_t* legacyCacheDataRegionBuffer() const;
+
+    //
+    // Returns a pointer to the shared cache optimized Objective-C data structures
+    //
+    const objc_opt::objc_opt_t* objcOpt() const;
+
+    //
+    // Returns a pointer to the shared cache optimized Objective-C pointer structures
+    //
+    const void* objcOptPtrs() const;
+
+    // Returns true if the cache has any slide info, either old style on a single data region
+    // or on each individual data mapping
+    bool                hasSlideInfo() const;
+
+    void                forEachSlideInfo(void (^handler)(uint64_t mappingStartAddress, uint64_t mappingSize,
+                                                         const uint8_t* mappingPagesStart,
+                                                         uint64_t slideInfoOffset, uint64_t slideInfoSize,
+                                                         const dyld_cache_slide_info* slideInfoHeader)) const;
+
 
     //
     // returns true if the offset is in the TEXT of some cached dylib and sets *index to the dylib index
     //
     bool              addressInText(uint32_t cacheOffset, uint32_t* index) const;
 
+    uint32_t          patchableExportCount(uint32_t imageIndex) const;
+    void              forEachPatchableExport(uint32_t imageIndex, void (^handler)(uint32_t cacheOffsetOfImpl, const char* exportName)) const;
+    void              forEachPatchableUseOfExport(uint32_t imageIndex, uint32_t cacheOffsetOfImpl,
+                                                  void (^handler)(dyld_cache_patchable_location patchLocation)) const;
 
+    // Helper to get the addend for a patch location since we don't want to put C++ in the shared cache format header
+    static uint64_t getAddend(const dyld_cache_patchable_location& loc) {
+        uint64_t unsingedAddend = loc.addend;
+        int64_t signedAddend = (int64_t)unsingedAddend;
+        signedAddend = (signedAddend << 52) >> 52;
+        return (uint64_t)signedAddend;
+    }
+    // Helper to get the key nam for a patch location since we don't want to put C++ in the shared cache format header
+    static const char* keyName(const dyld_cache_patchable_location& patchLocation) {
+        dyld3::MachOLoaded::ChainedFixupPointerOnDisk dummy;
+        dummy.arm64e.authRebase.auth = 1;
+        dummy.arm64e.authRebase.bind = 0;
+        dummy.arm64e.authRebase.key  = patchLocation.key;
+        return dummy.arm64e.keyName();
+    }
+
+#if (BUILDING_LIBDYLD || BUILDING_DYLD)
+
+    typedef void (*DataConstLogFunc)(const char*, ...) __attribute__((format(printf, 1, 2)));
+    void changeDataConstPermissions(mach_port_t machTask, uint32_t permissions, DataConstLogFunc logFunc) const;
+
+    struct DataConstLazyScopedWriter {
+        DataConstLazyScopedWriter(const DyldSharedCache* cache, mach_port_t machTask, DataConstLogFunc logFunc);
+        ~DataConstLazyScopedWriter();
+
+        // Delete all other kinds of constructors to make sure we don't accidentally copy these around
+        DataConstLazyScopedWriter() = delete;
+        DataConstLazyScopedWriter(const DataConstLazyScopedWriter&) = delete;
+        DataConstLazyScopedWriter(DataConstLazyScopedWriter&&) = delete;
+        DataConstLazyScopedWriter& operator=(const DataConstLazyScopedWriter&) = delete;
+        DataConstLazyScopedWriter& operator=(DataConstLazyScopedWriter&&) = delete;
+
+        void makeWriteable();
+
+        const DyldSharedCache*  cache           = nullptr;
+        mach_port_t             machTask        = MACH_PORT_NULL;
+        DataConstLogFunc        logFunc         = nullptr;
+        bool                    wasMadeWritable = false;
+    };
+
+    struct DataConstScopedWriter {
+        DataConstScopedWriter(const DyldSharedCache* cache, mach_port_t machTask, DataConstLogFunc logFunc);
+        ~DataConstScopedWriter() = default;
+
+        // Delete all other kinds of constructors to make sure we don't accidentally copy these around
+        DataConstScopedWriter() = delete;
+        DataConstScopedWriter(const DataConstScopedWriter&) = delete;
+        DataConstScopedWriter(DataConstScopedWriter&&) = delete;
+        DataConstScopedWriter& operator=(const DataConstScopedWriter&) = delete;
+        DataConstScopedWriter& operator=(DataConstScopedWriter&&) = delete;
+
+        DataConstLazyScopedWriter writer;
+    };
+#endif
+
+#if !(BUILDING_LIBDYLD || BUILDING_DYLD)
+    // MRM map file generator
+    std::string generateJSONMap(const char* disposition) const;
+
+    // This generates a JSON representation of deep reverse dependency information in the cache.
+    // For each dylib, the output will contain the list of all the other dylibs transitively
+    // dependening on that library. (For example, the entry for libsystem will contain almost
+    // all of the dylibs in the cache ; a very high-level framework such as ARKit will have way
+    // fewer dependents).
+    // This is used by the shared cache ordering script to put "deep" dylibs used by everybody
+    // closer to the center of the cache.
+    std::string generateJSONDependents() const;
+#endif
+
+    // Note these enum entries are only valid for 64-bit archs.
+    enum class ConstantClasses {
+        cfStringAtomSize = 32
+    };
+
+    // Returns the start and size of the range in the shared cache of the ObjC constants, such as
+    // all of the CFString's which have been moved in to a contiguous range
+    std::pair<const void*, uint64_t> getObjCConstantRange() const;
+
+#if !(BUILDING_LIBDYLD || BUILDING_DYLD)
+    dyld3::MachOAnalyzer::VMAddrConverter makeVMAddrConverter(bool contentRebased) const;
+#endif
 
     dyld_cache_header header;
+
+    // The most mappings we could generate.
+    // For now its __TEXT, __DATA_CONST, __DATA_DIRTY, __DATA, __LINKEDIT,
+    // and optionally also __AUTH, __AUTH_CONST, __AUTH_DIRTY
+    static const uint32_t MaxMappings = 8;
+
+private:
+    // Returns a variable of type "const T" which corresponds to the header field with the given unslid address
+    template<typename T>
+    const T getAddrField(uint64_t addr) const;
+
+#if !(BUILDING_LIBDYLD || BUILDING_DYLD)
+    void fillMachOAnalyzersMap(std::unordered_map<std::string,dyld3::MachOAnalyzer*> & dylibAnalyzers) const;
+    void computeReverseDependencyMapForDylib(std::unordered_map<std::string, std::set<std::string>> &reverseDependencyMap, const std::unordered_map<std::string,dyld3::MachOAnalyzer*> & dylibAnalyzers, const std::string &loadPath) const;
+    void computeReverseDependencyMap(std::unordered_map<std::string, std::set<std::string>> &reverseDependencyMap) const;
+    void findDependentsRecursively(std::unordered_map<std::string, std::set<std::string>> &transitiveDependents, const std::unordered_map<std::string, std::set<std::string>> &reverseDependencyMap, std::set<std::string> & visited, const std::string &loadPath) const;
+    void computeTransitiveDependents(std::unordered_map<std::string, std::set<std::string>> & transitiveDependents) const;
+#endif
 };
 
 

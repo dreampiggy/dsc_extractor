@@ -54,9 +54,10 @@ public:
 	virtual bool						libReExported(unsigned int) const;
 	virtual bool						libIsUpward(unsigned int) const;
 	virtual void						setLibImage(unsigned int, ImageLoader*, bool, bool);
-	virtual void						doBind(const LinkContext& context, bool forceLazysBound);
-	virtual void						doBindJustLazies(const LinkContext& context);
-	virtual uintptr_t					doBindLazySymbol(uintptr_t* lazyPointer, const LinkContext& context);
+	virtual void						doBind(const LinkContext& context, bool forceLazysBound, const ImageLoader* reExportParent);
+	virtual void						doBindJustLazies(const LinkContext& context, DyldSharedCache::DataConstLazyScopedWriter& patcher);
+	virtual uintptr_t					doBindLazySymbol(uintptr_t* lazyPointer, const LinkContext& context,
+														 DyldSharedCache::DataConstLazyScopedWriter& patcher);
 	virtual uintptr_t					doBindFastLazySymbol(uint32_t lazyBindingInfoOffset, const LinkContext& context, void (*lock)(), void (*unlock)());
 	virtual const char*					findClosestSymbol(const void* addr, const void** closestAddr) const;
 	virtual	void						initializeCoalIterator(CoalIterator&, unsigned int loadOrder, unsigned);
@@ -68,6 +69,8 @@ protected:
 	virtual void						doInterpose(const LinkContext& context);
 	virtual void						dynamicInterpose(const LinkContext& context);
 	virtual void						setDyldInfo(const dyld_info_command*) {}
+	virtual void						setChainedFixups(const linkedit_data_command*) {}
+	virtual void						setExportsTrie(const linkedit_data_command*) {}
 	virtual void						setSymbolTableInfo(const macho_nlist*, const char*, const dysymtab_command*);
 	virtual	bool						isSubframeworkOf(const LinkContext& context, const ImageLoader* image) const;
 	virtual	bool						hasSubLibrary(const LinkContext& context, const ImageLoader* child) const;
@@ -111,7 +114,6 @@ private:
 															const ImageLoader* targetImage, const LinkContext& context);
 	void								bindIndirectSymbolPointers(const LinkContext& context, bool bindNonLazys, bool bindLazys);
 	void								initializeLazyStubs(const LinkContext& context);
-	void								prefetchLINKEDIT(const LinkContext& context);
 #if SPLIT_SEG_DYLIB_SUPPORT	
 	unsigned int						getExtraZeroFillEntriesCount();
 	void								initMappingTable(uint64_t offsetInFat, shared_file_mapping_np *mappingTable);

@@ -29,55 +29,20 @@
 #include <mach/mach.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <assert.h>
 #include <mach-o/reloc.h>
 #include <mach-o/nlist.h>
-#include <CommonCrypto/CommonDigest.h>
+extern "C" {
+  #include <corecrypto/ccdigest.h>
+  #include <corecrypto/ccsha1.h>
+  #include <corecrypto/ccsha2.h>
+}
 
-#include <stdio.h>
-
+#include "MachOFile.h"
 #include "MachOLoaded.h"
-#include "MachOFile.h"
-#include "MachOFile.h"
 #include "CodeSigningTypes.h"
-
-
-#ifndef LC_BUILD_VERSION
-    #define LC_BUILD_VERSION 0x32 /* build for platform min OS version */
-
-    /*
-     * The build_version_command contains the min OS version on which this
-     * binary was built to run for its platform.  The list of known platforms and
-     * tool values following it.
-     */
-    struct build_version_command {
-        uint32_t    cmd;        /* LC_BUILD_VERSION */
-        uint32_t    cmdsize;    /* sizeof(struct build_version_command) plus */
-        /* ntools * sizeof(struct build_tool_version) */
-        uint32_t    platform;   /* platform */
-        uint32_t    minos;      /* X.Y.Z is encoded in nibbles xxxx.yy.zz */
-        uint32_t    sdk;        /* X.Y.Z is encoded in nibbles xxxx.yy.zz */
-        uint32_t    ntools;     /* number of tool entries following this */
-    };
-
-    struct build_tool_version {
-        uint32_t    tool;       /* enum for the tool */
-        uint32_t    version;    /* version number of the tool */
-    };
-
-    /* Known values for the platform field above. */
-    #define PLATFORM_MACOS      1
-    #define PLATFORM_IOS        2
-    #define PLATFORM_TVOS       3
-    #define PLATFORM_WATCHOS    4
-    #define PLATFORM_BRIDGEOS   5
-
-    /* Known values for the tool field above. */
-    #define TOOL_CLANG    1
-    #define TOOL_SWIFT    2
-    #define TOOL_LD       3
-#endif
 
 
 
@@ -87,6 +52,8 @@ namespace dyld3 {
 void MachOLoaded::getLinkEditLoadCommands(Diagnostics& diag, LinkEditInfo& result) const
 {
     result.dyldInfo       = nullptr;
+    result.exportsTrie    = nullptr;
+    result.chainedFixups  = nullptr;
     result.symTab         = nullptr;
     result.dynSymTab      = nullptr;
     result.splitSegInfo   = nullptr;
@@ -105,6 +72,20 @@ void MachOLoaded::getLinkEditLoadCommands(Diagnostics& diag, LinkEditInfo& resul
                 else if ( result.dyldInfo != nullptr )
                     diag.error("multiple LC_DYLD_INFO load commands");
                 result.dyldInfo = (dyld_info_command*)cmd;
+                break;
+            case LC_DYLD_EXPORTS_TRIE:
+                if ( cmd->cmdsize != sizeof(linkedit_data_command) )
+                    diag.error("LC_DYLD_EXPORTS_TRIE load command size wrong");
+                else if ( result.exportsTrie != nullptr )
+                    diag.error("multiple LC_DYLD_EXPORTS_TRIE load commands");
+                result.exportsTrie = (linkedit_data_command*)cmd;
+                break;
+            case LC_DYLD_CHAINED_FIXUPS:
+                if ( cmd->cmdsize != sizeof(linkedit_data_command) )
+                    diag.error("LC_DYLD_CHAINED_FIXUPS load command size wrong");
+                else if ( result.chainedFixups != nullptr )
+                    diag.error("multiple LC_DYLD_CHAINED_FIXUPS load commands");
+                result.chainedFixups = (linkedit_data_command*)cmd;
                 break;
             case LC_SYMTAB:
                 if ( cmd->cmdsize != sizeof(symtab_command) )
@@ -168,8 +149,6 @@ void MachOLoaded::getLinkEditLoadCommands(Diagnostics& diag, LinkEditInfo& resul
             case LC_BUILD_VERSION:
                 if ( cmd->cmdsize != (sizeof(build_version_command) + ((build_version_command*)cmd)->ntools * sizeof(build_tool_version)) )
                     diag.error("LC_BUILD_VERSION load command size wrong");
-                else if ( hasMinVersion )
-                    diag.error("LC_BUILD_VERSION cannot coexist LC_VERSION_MIN_* with load commands");
                 break;
             case LC_ENCRYPTION_INFO:
                 if ( cmd->cmdsize != sizeof(encryption_info_command) )
@@ -202,6 +181,23 @@ void MachOLoaded::getLinkEditPointers(Diagnostics& diag, LinkEditInfo& result) c
         getLayoutInfo(result.layout);
 }
 
+const uint8_t* MachOLoaded::getExportsTrie(const LinkEditInfo& leInfo, uint64_t& trieSize) const
+{
+    if ( leInfo.exportsTrie != nullptr) {
+        trieSize = leInfo.exportsTrie->datasize;
+        uint64_t offsetInLinkEdit = leInfo.exportsTrie->dataoff - leInfo.layout.linkeditFileOffset;
+        return (uint8_t*)this + (leInfo.layout.linkeditUnslidVMAddr - leInfo.layout.textUnslidVMAddr) + offsetInLinkEdit;
+    }
+    else if ( leInfo.dyldInfo != nullptr ) {
+        trieSize = leInfo.dyldInfo->export_size;
+        uint64_t offsetInLinkEdit = leInfo.dyldInfo->export_off - leInfo.layout.linkeditFileOffset;
+        return (uint8_t*)this + (leInfo.layout.linkeditUnslidVMAddr - leInfo.layout.textUnslidVMAddr) + offsetInLinkEdit;
+    }
+    trieSize = 0;
+    return nullptr;
+}
+
+
 void MachOLoaded::getLayoutInfo(LayoutInfo& result) const
 {
     forEachSegment(^(const SegmentInfo& info, bool& stop) {
@@ -215,6 +211,7 @@ void MachOLoaded::getLayoutInfo(LayoutInfo& result) const
             result.linkeditFileSize     = (uint32_t)info.fileSize;
             result.linkeditSegIndex     = info.segIndex;
         }
+        result.lastSegIndex = info.segIndex;
     });
 }
 
@@ -228,10 +225,10 @@ bool MachOLoaded::hasExportTrie(uint32_t& runtimeOffset, uint32_t& size) const
     diag.assertNoError();   // any malformations in the file should have been caught by earlier validate() call
     if ( diag.hasError() )
         return false;
-    if ( leInfo.dyldInfo != nullptr ) {
-        uint32_t offsetInLinkEdit = leInfo.dyldInfo->export_off - leInfo.layout.linkeditFileOffset;
-        runtimeOffset = offsetInLinkEdit + (uint32_t)(leInfo.layout.linkeditUnslidVMAddr - leInfo.layout.textUnslidVMAddr);
-        size = leInfo.dyldInfo->export_size;
+    uint64_t trieSize;
+    if ( const uint8_t* trie = getExportsTrie(leInfo, trieSize) ) {
+        runtimeOffset = (uint32_t)(trie - (uint8_t*)this);
+        size = (uint32_t)trieSize;
         return true;
     }
     return false;
@@ -247,7 +244,7 @@ bool MachOLoaded::hasExportedSymbol(const char* symbolName, DependentToMachOLoad
     ResolverFunc resolver;
     Diagnostics diag;
     FoundSymbol foundInfo;
-    if ( findExportedSymbol(diag, symbolName, foundInfo, finder) ) {
+    if ( findExportedSymbol(diag, symbolName, false, foundInfo, finder) ) {
         switch ( foundInfo.kind ) {
             case FoundSymbol::Kind::headerOffset: {
                 *result = (uint8_t*)foundInfo.foundInDylib + foundInfo.value;
@@ -282,15 +279,15 @@ bool MachOLoaded::hasExportedSymbol(const char* symbolName, DependentToMachOLoad
 }
 #endif // BUILDING_LIBDYLD
 
-bool MachOLoaded::findExportedSymbol(Diagnostics& diag, const char* symbolName, FoundSymbol& foundInfo, DependentToMachOLoaded findDependent) const
+bool MachOLoaded::findExportedSymbol(Diagnostics& diag, const char* symbolName, bool weakImport, FoundSymbol& foundInfo, DependentToMachOLoaded findDependent) const
 {
     LinkEditInfo leInfo;
     getLinkEditPointers(diag, leInfo);
     if ( diag.hasError() )
         return false;
-    if ( leInfo.dyldInfo != nullptr ) {
-        const uint8_t* trieStart = getLinkEditContent(leInfo.layout, leInfo.dyldInfo->export_off);
-        const uint8_t* trieEnd   = trieStart + leInfo.dyldInfo->export_size;
+    uint64_t trieSize;
+    if ( const uint8_t* trieStart = getExportsTrie(leInfo, trieSize) ) {
+        const uint8_t* trieEnd   = trieStart + trieSize;
         const uint8_t* node      = trieWalk(diag, trieStart, trieEnd, symbolName);
         if ( node == nullptr ) {
             // symbol not exported from this image. Seach any re-exported dylibs
@@ -299,7 +296,7 @@ bool MachOLoaded::findExportedSymbol(Diagnostics& diag, const char* symbolName, 
             forEachDependentDylib(^(const char* loadPath, bool isWeak, bool isReExport, bool isUpward, uint32_t compatVersion, uint32_t curVersion, bool& stop) {
                 if ( isReExport && findDependent ) {
                     if ( const MachOLoaded* depMH = findDependent(this, depIndex) ) {
-                       if ( depMH->findExportedSymbol(diag, symbolName, foundInfo, findDependent) ) {
+                       if ( depMH->findExportedSymbol(diag, symbolName, weakImport, foundInfo, findDependent) ) {
                             stop = true;
                             foundInReExportedDylib = true;
                         }
@@ -325,7 +322,10 @@ bool MachOLoaded::findExportedSymbol(Diagnostics& diag, const char* symbolName, 
             }
             uint32_t depIndex = (uint32_t)(ordinal-1);
             if ( const MachOLoaded* depMH = findDependent(this, depIndex) ) {
-                return depMH->findExportedSymbol(diag, importedName, foundInfo, findDependent);
+                return depMH->findExportedSymbol(diag, importedName, weakImport, foundInfo, findDependent);
+            }
+            else if (weakImport) {
+                return false;
             }
             else {
                 diag.error("dependent dylib %lld not found for re-exported symbol %s", ordinal, symbolName);
@@ -385,7 +385,7 @@ bool MachOLoaded::findExportedSymbol(Diagnostics& diag, const char* symbolName, 
             forEachDependentDylib(^(const char* loadPath, bool isWeak, bool isReExport, bool isUpward, uint32_t compatVersion, uint32_t curVersion, bool& stop) {
                 if ( isReExport && findDependent ) {
                     if ( const MachOLoaded* depMH = findDependent(this, depIndex) ) {
-                        if ( depMH->findExportedSymbol(diag, symbolName, foundInfo, findDependent) ) {
+                        if ( depMH->findExportedSymbol(diag, symbolName, weakImport, foundInfo, findDependent) ) {
                             stop = true;
                         }
                     }
@@ -584,6 +584,15 @@ bool MachOLoaded::findClosestSymbol(uint64_t address, const char** symbolName, u
         return false;
     uint64_t targetUnslidAddress = address - leInfo.layout.slide;
 
+    // find section index the address is in to validate n_sect
+    __block uint32_t sectionIndexForTargetAddress = 0;
+    forEachSection(^(const SectionInfo& sectInfo, bool malformedSectionRange, bool& stop) {
+        ++sectionIndexForTargetAddress;
+        if ( (sectInfo.sectAddr <= targetUnslidAddress) && (targetUnslidAddress < sectInfo.sectAddr+sectInfo.sectSize) ) {
+            stop = true;
+        }
+    });
+
     uint32_t               maxStringOffset  = leInfo.symTab->strsize;
     const char*            stringPool       =             (char*)getLinkEditContent(leInfo.layout, leInfo.symTab->stroff);
     const struct nlist*    symbols          = (struct nlist*)   (getLinkEditContent(leInfo.layout, leInfo.symTab->symoff));
@@ -596,10 +605,10 @@ bool MachOLoaded::findClosestSymbol(uint64_t address, const char** symbolName, u
         for (const struct nlist_64* s = globalsStart; s < globalsEnd; ++s) {
             if ( (s->n_type & N_TYPE) == N_SECT ) {
                 if ( bestSymbol == nullptr ) {
-                    if ( s->n_value <= targetUnslidAddress )
+                    if ( (s->n_value <= targetUnslidAddress) && (s->n_sect == sectionIndexForTargetAddress) )
                         bestSymbol = s;
                 }
-                else if ( (s->n_value <= targetUnslidAddress) && (bestSymbol->n_value < s->n_value) ) {
+                else if ( (s->n_value <= targetUnslidAddress) && (bestSymbol->n_value < s->n_value) && (s->n_sect == sectionIndexForTargetAddress) ) {
                     bestSymbol = s;
                 }
             }
@@ -610,10 +619,10 @@ bool MachOLoaded::findClosestSymbol(uint64_t address, const char** symbolName, u
         for (const struct nlist_64* s = localsStart; s < localsEnd; ++s) {
              if ( ((s->n_type & N_TYPE) == N_SECT) && ((s->n_type & N_STAB) == 0) ) {
                 if ( bestSymbol == nullptr ) {
-                    if ( s->n_value <= targetUnslidAddress )
+                    if ( (s->n_value <= targetUnslidAddress) && (s->n_sect == sectionIndexForTargetAddress) )
                         bestSymbol = s;
                 }
-                else if ( (s->n_value <= targetUnslidAddress) && (bestSymbol->n_value < s->n_value) ) {
+                else if ( (s->n_value <= targetUnslidAddress) && (bestSymbol->n_value < s->n_value) && (s->n_sect == sectionIndexForTargetAddress) ) {
                     bestSymbol = s;
                 }
             }
@@ -633,10 +642,10 @@ bool MachOLoaded::findClosestSymbol(uint64_t address, const char** symbolName, u
         for (const struct nlist* s = globalsStart; s < globalsEnd; ++s) {
             if ( (s->n_type & N_TYPE) == N_SECT ) {
                 if ( bestSymbol == nullptr ) {
-                    if ( s->n_value <= targetUnslidAddress )
+                    if ( (s->n_value <= targetUnslidAddress) && (s->n_sect == sectionIndexForTargetAddress) )
                         bestSymbol = s;
                 }
-                else if ( (s->n_value <= targetUnslidAddress) && (bestSymbol->n_value < s->n_value) ) {
+                else if ( (s->n_value <= targetUnslidAddress) && (bestSymbol->n_value < s->n_value) && (s->n_sect == sectionIndexForTargetAddress) ) {
                     bestSymbol = s;
                 }
             }
@@ -647,10 +656,10 @@ bool MachOLoaded::findClosestSymbol(uint64_t address, const char** symbolName, u
         for (const struct nlist* s = localsStart; s < localsEnd; ++s) {
              if ( ((s->n_type & N_TYPE) == N_SECT) && ((s->n_type & N_STAB) == 0) ) {
                 if ( bestSymbol == nullptr ) {
-                    if ( s->n_value <= targetUnslidAddress )
+                    if ( (s->n_value <= targetUnslidAddress) && (s->n_sect == sectionIndexForTargetAddress) )
                         bestSymbol = s;
                 }
-                else if ( (s->n_value <= targetUnslidAddress) && (bestSymbol->n_value < s->n_value) ) {
+                else if ( (s->n_value <= targetUnslidAddress) && (bestSymbol->n_value < s->n_value) && (s->n_sect == sectionIndexForTargetAddress) ) {
                     bestSymbol = s;
                 }
             }
@@ -699,9 +708,8 @@ bool MachOLoaded::intersectsRange(uintptr_t start, uintptr_t length) const
 
 const uint8_t* MachOLoaded::trieWalk(Diagnostics& diag, const uint8_t* start, const uint8_t* end, const char* symbol)
 {
-    uint32_t visitedNodeOffsets[128];
-    int visitedNodeOffsetCount = 0;
-    visitedNodeOffsets[visitedNodeOffsetCount++] = 0;
+    STACK_ALLOC_OVERFLOW_SAFE_ARRAY(uint32_t, visitedNodeOffsets, 128);
+    visitedNodeOffsets.push_back(0);
     const uint8_t* p = start;
     while ( p < end ) {
         uint64_t terminalSize = *p++;
@@ -770,17 +778,14 @@ const uint8_t* MachOLoaded::trieWalk(Diagnostics& diag, const uint8_t* start, co
                 diag.error("malformed trie child, nodeOffset=0x%llX out of range\n", nodeOffset);
                return nullptr;
             }
-            for (int i=0; i < visitedNodeOffsetCount; ++i) {
-                if ( visitedNodeOffsets[i] == nodeOffset ) {
+            // check for cycles
+            for (uint32_t aVisitedNodeOffset : visitedNodeOffsets) {
+                if ( aVisitedNodeOffset == nodeOffset ) {
                     diag.error("malformed trie child, cycle to nodeOffset=0x%llX\n", nodeOffset);
                     return nullptr;
                 }
             }
-            visitedNodeOffsets[visitedNodeOffsetCount++] = (uint32_t)nodeOffset;
-            if ( visitedNodeOffsetCount >= 128 ) {
-                diag.error("malformed trie too deep\n");
-                return nullptr;
-            }
+            visitedNodeOffsets.push_back((uint32_t)nodeOffset);
             p = &start[nodeOffset];
         }
         else
@@ -789,34 +794,51 @@ const uint8_t* MachOLoaded::trieWalk(Diagnostics& diag, const uint8_t* start, co
     return nullptr;
 }
 
-bool MachOLoaded::cdHashOfCodeSignature(const void* codeSigStart, size_t codeSignLen, uint8_t cdHash[20]) const
+void MachOLoaded::forEachCDHashOfCodeSignature(const void* codeSigStart, size_t codeSignLen,
+                                               void (^callback)(const uint8_t cdHash[20])) const
 {
-    const CS_CodeDirectory* cd = (const CS_CodeDirectory*)findCodeDirectoryBlob(codeSigStart, codeSignLen);
-    if ( cd == nullptr )
-        return false;
-
-    uint32_t cdLength = htonl(cd->length);
-    if ( cd->hashType == CS_HASHTYPE_SHA384 ) {
-        uint8_t digest[CC_SHA384_DIGEST_LENGTH];
-        CC_SHA384(cd, cdLength, digest);
-        // cd-hash of sigs that use SHA384 is the first 20 bytes of the SHA384 of the code digest
-        memcpy(cdHash, digest, 20);
-        return true;
-    }
-    else if ( (cd->hashType == CS_HASHTYPE_SHA256) || (cd->hashType == CS_HASHTYPE_SHA256_TRUNCATED) ) {
-        uint8_t digest[CC_SHA256_DIGEST_LENGTH];
-        CC_SHA256(cd, cdLength, digest);
-        // cd-hash of sigs that use SHA256 is the first 20 bytes of the SHA256 of the code digest
-        memcpy(cdHash, digest, 20);
-        return true;
-    }
-    else if ( cd->hashType == CS_HASHTYPE_SHA1 ) {
-        // compute hash directly into return buffer
-        CC_SHA1(cd, cdLength, cdHash);
-        return true;
-    }
-
-    return false;
+    forEachCodeDirectoryBlob(codeSigStart, codeSignLen, ^(const void *cdBuffer) {
+        const CS_CodeDirectory* cd = (const CS_CodeDirectory*)cdBuffer;
+        uint32_t cdLength = htonl(cd->length);
+        uint8_t cdHash[20];
+        if ( cd->hashType == CS_HASHTYPE_SHA384 ) {
+            uint8_t digest[CCSHA384_OUTPUT_SIZE];
+            const struct ccdigest_info* di = ccsha384_di();
+            ccdigest_di_decl(di, tempBuf); // declares tempBuf array in stack
+            ccdigest_init(di, tempBuf);
+            ccdigest_update(di, tempBuf, cdLength, cd);
+            ccdigest_final(di, tempBuf, digest);
+            ccdigest_di_clear(di, tempBuf);
+            // cd-hash of sigs that use SHA384 is the first 20 bytes of the SHA384 of the code digest
+            memcpy(cdHash, digest, 20);
+            callback(cdHash);
+            return;
+        }
+        else if ( (cd->hashType == CS_HASHTYPE_SHA256) || (cd->hashType == CS_HASHTYPE_SHA256_TRUNCATED) ) {
+            uint8_t digest[CCSHA256_OUTPUT_SIZE];
+            const struct ccdigest_info* di = ccsha256_di();
+            ccdigest_di_decl(di, tempBuf); // declares tempBuf array in stack
+            ccdigest_init(di, tempBuf);
+            ccdigest_update(di, tempBuf, cdLength, cd);
+            ccdigest_final(di, tempBuf, digest);
+            ccdigest_di_clear(di, tempBuf);
+            // cd-hash of sigs that use SHA256 is the first 20 bytes of the SHA256 of the code digest
+            memcpy(cdHash, digest, 20);
+            callback(cdHash);
+            return;
+        }
+        else if ( cd->hashType == CS_HASHTYPE_SHA1 ) {
+            // compute hash directly into return buffer
+            const struct ccdigest_info* di = ccsha1_di();
+            ccdigest_di_decl(di, tempBuf); // declares tempBuf array in stack
+            ccdigest_init(di, tempBuf);
+            ccdigest_update(di, tempBuf, cdLength, cd);
+            ccdigest_final(di, tempBuf, cdHash);
+            ccdigest_di_clear(di, tempBuf);
+            callback(cdHash);
+            return;
+        }
+    });
 }
 
 
@@ -840,17 +862,24 @@ static unsigned int hash_rank(const CS_CodeDirectory *cd)
     return 0;
 }
 
-
-// Note, this has to match the kernel
-static const uint32_t hashPriorities_watchOS[] = {
+// Note, this does NOT match the kernel.
+// On watchOS, in main executables, we will record all cd hashes then make sure
+// one of the ones we record matches the kernel.
+// This list is only for dylibs where we embed the cd hash in the closure instead of the
+// mod time and inode
+// This is sorted so that we choose sha1 first when checking dylibs
+static const uint32_t hashPriorities_watchOS_dylibs[] = {
+    CS_HASHTYPE_SHA256_TRUNCATED,
+    CS_HASHTYPE_SHA256,
+    CS_HASHTYPE_SHA384,
     CS_HASHTYPE_SHA1
 };
 
-static unsigned int hash_rank_watchOS(const CS_CodeDirectory *cd)
+static unsigned int hash_rank_watchOS_dylibs(const CS_CodeDirectory *cd)
 {
     uint32_t type = cd->hashType;
-    for (uint32_t n = 0; n < sizeof(hashPriorities_watchOS) / sizeof(hashPriorities_watchOS[0]); ++n) {
-        if (hashPriorities_watchOS[n] == type)
+    for (uint32_t n = 0; n < sizeof(hashPriorities_watchOS_dylibs) / sizeof(hashPriorities_watchOS_dylibs[0]); ++n) {
+        if (hashPriorities_watchOS_dylibs[n] == type)
             return n + 1;
     }
 
@@ -858,25 +887,33 @@ static unsigned int hash_rank_watchOS(const CS_CodeDirectory *cd)
     return 0;
 }
 
-const void* MachOLoaded::findCodeDirectoryBlob(const void* codeSigStart, size_t codeSignLen) const
+// This calls the callback for all code directories required for a given platform/binary combination.
+// On watchOS main executables this is all cd hashes.
+// On watchOS dylibs this is only the single cd hash we need (by rank defined by dyld, not the kernel).
+// On all other platforms this always returns a single best cd hash (ranked to match the kernel).
+// Note the callback parameter is really a CS_CodeDirectory.
+void MachOLoaded::forEachCodeDirectoryBlob(const void* codeSigStart, size_t codeSignLen,
+                                           void (^callback)(const void* cd)) const
 {
     // verify min length of overall code signature
     if ( codeSignLen < sizeof(CS_SuperBlob) )
-        return nullptr;
+        return;
 
     // verify magic at start
     const CS_SuperBlob* codeSuperBlob = (CS_SuperBlob*)codeSigStart;
     if ( codeSuperBlob->magic != htonl(CSMAGIC_EMBEDDED_SIGNATURE) )
-        return nullptr;
+        return;
 
     // verify count of sub-blobs not too large
     uint32_t subBlobCount = htonl(codeSuperBlob->count);
     if ( (codeSignLen-sizeof(CS_SuperBlob))/sizeof(CS_BlobIndex) < subBlobCount )
-        return nullptr;
+        return;
 
-    // Note: The kernel currently always uses sha1 for watchOS, even if other hashes are available.
-    const bool isWatchOS = this->supportsPlatform(Platform::watchOS);
-    auto hashRankFn = isWatchOS ? &hash_rank_watchOS : &hash_rank;
+    // Note: The kernel sometimes chooses sha1 on watchOS, and sometimes sha256.
+    // Embed all of them so that we just need to match any of them
+    const bool isWatchOS = this->builtForPlatform(Platform::watchOS);
+    const bool isMainExecutable = this->isMainExecutable();
+    auto hashRankFn = isWatchOS ? &hash_rank_watchOS_dylibs : &hash_rank;
 
     // walk each sub blob, looking at ones with type CSSLOT_CODEDIRECTORY
     const CS_CodeDirectory* bestCd = nullptr;
@@ -897,41 +934,44 @@ const void* MachOLoaded::findCodeDirectoryBlob(const void* codeSigStart, size_t 
         // verify code directory length not out of range
         if ( cdLength > (codeSignLen - cdOffset) )
             continue;
+
+        // The watch main executable wants to know about all cd hashes
+        if ( isWatchOS && isMainExecutable ) {
+            callback(cd);
+            continue;
+        }
+
         if ( cd->magic == htonl(CSMAGIC_CODEDIRECTORY) ) {
             if ( !bestCd || (hashRankFn(cd) > hashRankFn(bestCd)) )
                 bestCd = cd;
         }
     }
-    return bestCd;
+
+    // Note this callback won't happen on watchOS as that one was done in the loop
+    if ( bestCd != nullptr )
+        callback(bestCd);
 }
 
 
-// Regular pointer which needs to fit in 51-bits of value.
-// C++ RTTI uses the top bit, so we'll allow the whole top-byte
-// and the signed-extended bottom 43-bits to be fit in to 51-bits.
-uint64_t MachOLoaded::ChainedFixupPointerOnDisk::signExtend51(uint64_t value51)
+uint64_t MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::unpackTarget() const
 {
-    uint64_t top8Bits     = value51 & 0x007F80000000000ULL;
-    uint64_t bottom43Bits = value51 & 0x000007FFFFFFFFFFULL;
-    uint64_t newValue     = (top8Bits << 13) | (((intptr_t)(bottom43Bits << 21) >> 21) & 0x00FFFFFFFFFFFFFF);
-    return newValue;
+    assert(this->authBind.bind == 0);
+    assert(this->authBind.auth == 0);
+    return ((uint64_t)(this->rebase.high8) << 56) | (this->rebase.target);
 }
 
-uint64_t MachOLoaded::ChainedFixupPointerOnDisk::PlainRebase::signExtendedTarget() const
+uint64_t MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signExtendedAddend() const
 {
-    return signExtend51(this->target);
-}
-
-uint64_t MachOLoaded::ChainedFixupPointerOnDisk::PlainBind::signExtendedAddend() const
-{
-    uint64_t addend19     = this->addend;
+    assert(this->authBind.bind == 1);
+    assert(this->authBind.auth == 0);
+    uint64_t addend19 = this->bind.addend;
     if ( addend19 & 0x40000 )
         return addend19 | 0xFFFFFFFFFFFC0000ULL;
     else
         return addend19;
 }
 
-const char* MachOLoaded::ChainedFixupPointerOnDisk::keyName(uint8_t keyBits)
+const char* MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::keyName(uint8_t keyBits)
 {
     static const char* names[] = {
         "IA", "IB", "DA", "DB"
@@ -939,38 +979,444 @@ const char* MachOLoaded::ChainedFixupPointerOnDisk::keyName(uint8_t keyBits)
     assert(keyBits < 4);
     return names[keyBits];
 }
-
-const char* MachOLoaded::ChainedFixupPointerOnDisk::AuthRebase::keyName() const
+const char* MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::keyName() const
 {
-    return ChainedFixupPointerOnDisk::keyName(this->key);
+    assert(this->authBind.auth == 1);
+    return keyName(this->authBind.key);
 }
 
-const char* MachOLoaded::ChainedFixupPointerOnDisk::AuthBind::keyName() const
+uint64_t MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(uint64_t unsignedAddr, void* loc, bool addrDiv, uint16_t diversity, uint8_t key)
 {
-    return ChainedFixupPointerOnDisk::keyName(this->key);
-}
-
-
-uint64_t MachOLoaded::ChainedFixupPointerOnDisk::signPointer(void* loc, uint64_t target) const
-{
+    // don't sign NULL
+    if ( unsignedAddr == 0 )
+        return 0;
+        
 #if __has_feature(ptrauth_calls)
-    uint64_t discriminator = authBind.diversity;
-    if ( authBind.addrDiv )
-        discriminator = __builtin_ptrauth_blend_discriminator(loc, discriminator);
-    switch ( authBind.key ) {
+    uint64_t extendedDiscriminator = diversity;
+    if ( addrDiv )
+        extendedDiscriminator = __builtin_ptrauth_blend_discriminator(loc, extendedDiscriminator);
+    switch ( key ) {
         case 0: // IA
-            return (uint64_t)__builtin_ptrauth_sign_unauthenticated((void*)target, 0, discriminator);
+            return (uintptr_t)__builtin_ptrauth_sign_unauthenticated((void*)unsignedAddr, 0, extendedDiscriminator);
         case 1: // IB
-            return (uint64_t)__builtin_ptrauth_sign_unauthenticated((void*)target, 1, discriminator);
+            return (uintptr_t)__builtin_ptrauth_sign_unauthenticated((void*)unsignedAddr, 1, extendedDiscriminator);
         case 2: // DA
-            return (uint64_t)__builtin_ptrauth_sign_unauthenticated((void*)target, 2, discriminator);
+            return (uintptr_t)__builtin_ptrauth_sign_unauthenticated((void*)unsignedAddr, 2, extendedDiscriminator);
         case 3: // DB
-            return (uint64_t)__builtin_ptrauth_sign_unauthenticated((void*)target, 3, discriminator);
+            return (uintptr_t)__builtin_ptrauth_sign_unauthenticated((void*)unsignedAddr, 3, extendedDiscriminator);
     }
+    assert(0 && "invalid signing key");
+#else
+    assert(0 && "arm64e signing only arm64e");
 #endif
-    return target;
 }
 
+
+uint64_t MachOLoaded::ChainedFixupPointerOnDisk::Arm64e::signPointer(void* loc, uint64_t target) const
+{
+    assert(this->authBind.auth == 1);
+    return signPointer(target, loc, authBind.addrDiv, authBind.diversity, authBind.key);
+}
+
+uint64_t MachOLoaded::ChainedFixupPointerOnDisk::Generic64::unpackedTarget() const
+{
+    return (((uint64_t)this->rebase.high8) << 56) | (uint64_t)(this->rebase.target);
+}
+
+uint64_t MachOLoaded::ChainedFixupPointerOnDisk::Generic64::signExtendedAddend() const
+{
+    uint64_t addend27     = this->bind.addend;
+    uint64_t top8Bits     = addend27 & 0x00007F80000ULL;
+    uint64_t bottom19Bits = addend27 & 0x0000007FFFFULL;
+    uint64_t newValue     = (top8Bits << 13) | (((uint64_t)(bottom19Bits << 37) >> 37) & 0x00FFFFFFFFFFFFFF);
+    return newValue;
+}
+
+const char* MachOLoaded::ChainedFixupPointerOnDisk::Kernel64::keyName() const
+{
+    static const char* names[] = {
+        "IA", "IB", "DA", "DB"
+    };
+    assert(this->isAuth == 1);
+    uint8_t keyBits = this->key;
+    assert(keyBits < 4);
+    return names[keyBits];
+}
+
+bool MachOLoaded::ChainedFixupPointerOnDisk::isRebase(uint16_t pointerFormat, uint64_t preferedLoadAddress, uint64_t& targetRuntimeOffset) const
+{
+    switch (pointerFormat) {
+       case DYLD_CHAINED_PTR_ARM64E:
+       case DYLD_CHAINED_PTR_ARM64E_USERLAND:
+       case DYLD_CHAINED_PTR_ARM64E_USERLAND24:
+       case DYLD_CHAINED_PTR_ARM64E_KERNEL:
+       case DYLD_CHAINED_PTR_ARM64E_FIRMWARE:
+            if ( this->arm64e.bind.bind )
+                return false;
+            if ( this->arm64e.authRebase.auth ) {
+                targetRuntimeOffset = this->arm64e.authRebase.target;
+                return true;
+            }
+            else {
+                targetRuntimeOffset = this->arm64e.unpackTarget();
+                if ( (pointerFormat == DYLD_CHAINED_PTR_ARM64E) || (pointerFormat == DYLD_CHAINED_PTR_ARM64E_FIRMWARE) ) {
+                    targetRuntimeOffset -= preferedLoadAddress;
+                }
+                return true;
+            }
+            break;
+        case DYLD_CHAINED_PTR_64:
+        case DYLD_CHAINED_PTR_64_OFFSET:
+            if ( this->generic64.bind.bind )
+                return false;
+            targetRuntimeOffset = this->generic64.unpackedTarget();
+            if ( pointerFormat == DYLD_CHAINED_PTR_64 )
+                targetRuntimeOffset -= preferedLoadAddress;
+            return true;
+            break;
+        case DYLD_CHAINED_PTR_64_KERNEL_CACHE:
+        case DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE:
+            targetRuntimeOffset = this->kernel64.target;
+            return true;
+            break;
+        case DYLD_CHAINED_PTR_32:
+            if ( this->generic32.bind.bind )
+                return false;
+            targetRuntimeOffset = this->generic32.rebase.target - preferedLoadAddress;
+            return true;
+            break;
+        case DYLD_CHAINED_PTR_32_FIRMWARE:
+            targetRuntimeOffset = this->firmware32.target - preferedLoadAddress;
+            return true;
+            break;
+        default:
+            break;
+    }
+    assert(0 && "unsupported pointer chain format");
+}
+
+bool MachOLoaded::ChainedFixupPointerOnDisk::isBind(uint16_t pointerFormat, uint32_t& bindOrdinal, int64_t& addend) const
+{
+    addend = 0;
+    switch (pointerFormat) {
+        case DYLD_CHAINED_PTR_ARM64E:
+        case DYLD_CHAINED_PTR_ARM64E_USERLAND:
+        case DYLD_CHAINED_PTR_ARM64E_USERLAND24:
+        case DYLD_CHAINED_PTR_ARM64E_KERNEL:
+        case DYLD_CHAINED_PTR_ARM64E_FIRMWARE:
+            if ( !this->arm64e.authBind.bind )
+                return false;
+            if ( this->arm64e.authBind.auth ) {
+                if ( pointerFormat == DYLD_CHAINED_PTR_ARM64E_USERLAND24 )
+                    bindOrdinal = this->arm64e.authBind24.ordinal;
+                else
+                    bindOrdinal = this->arm64e.authBind.ordinal;
+                return true;
+            }
+            else {
+                if ( pointerFormat == DYLD_CHAINED_PTR_ARM64E_USERLAND24 )
+                    bindOrdinal = this->arm64e.bind24.ordinal;
+                else
+                    bindOrdinal = this->arm64e.bind.ordinal;
+                addend = this->arm64e.signExtendedAddend();
+                return true;
+            }
+            break;
+        case DYLD_CHAINED_PTR_64:
+        case DYLD_CHAINED_PTR_64_OFFSET:
+            if ( !this->generic64.bind.bind )
+                return false;
+            bindOrdinal = this->generic64.bind.ordinal;
+            addend = this->generic64.bind.addend;
+            return true;
+            break;
+        case DYLD_CHAINED_PTR_32:
+            if ( !this->generic32.bind.bind )
+                return false;
+            bindOrdinal = this->generic32.bind.ordinal;
+            addend = this->generic32.bind.addend;
+            return true;
+            break;
+        case DYLD_CHAINED_PTR_64_KERNEL_CACHE:
+        case DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE:
+            return false;
+        default:
+            break;
+    }
+    assert(0 && "unsupported pointer chain format");
+}
+
+unsigned MachOLoaded::ChainedFixupPointerOnDisk::strideSize(uint16_t pointerFormat)
+{
+    switch (pointerFormat) {
+        case DYLD_CHAINED_PTR_ARM64E:
+        case DYLD_CHAINED_PTR_ARM64E_USERLAND:
+        case DYLD_CHAINED_PTR_ARM64E_USERLAND24:
+            return 8;
+        case DYLD_CHAINED_PTR_ARM64E_KERNEL:
+        case DYLD_CHAINED_PTR_ARM64E_FIRMWARE:
+        case DYLD_CHAINED_PTR_32_FIRMWARE:
+        case DYLD_CHAINED_PTR_64:
+        case DYLD_CHAINED_PTR_64_OFFSET:
+        case DYLD_CHAINED_PTR_32:
+        case DYLD_CHAINED_PTR_32_CACHE:
+        case DYLD_CHAINED_PTR_64_KERNEL_CACHE:
+            return 4;
+        case DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE:
+            return 1;
+    }
+    assert(0 && "unsupported pointer chain format");
+}
+
+#if BUILDING_DYLD || BUILDING_LIBDYLD
+void MachOLoaded::fixupAllChainedFixups(Diagnostics& diag, const dyld_chained_starts_in_image* starts, uintptr_t slide,
+                                        Array<const void*> bindTargets, void (^logFixup)(void* loc, void* newValue)) const
+{
+    forEachFixupInAllChains(diag, starts, true, ^(ChainedFixupPointerOnDisk* fixupLoc, const dyld_chained_starts_in_segment* segInfo, bool& stop) {
+        void* newValue;
+        switch (segInfo->pointer_format) {
+#if __LP64__
+  #if  __has_feature(ptrauth_calls)
+           case DYLD_CHAINED_PTR_ARM64E:
+           case DYLD_CHAINED_PTR_ARM64E_KERNEL:
+           case DYLD_CHAINED_PTR_ARM64E_USERLAND:
+           case DYLD_CHAINED_PTR_ARM64E_USERLAND24:
+               if ( fixupLoc->arm64e.authRebase.auth ) {
+                    if ( fixupLoc->arm64e.authBind.bind ) {
+                        uint32_t bindOrdinal = (segInfo->pointer_format == DYLD_CHAINED_PTR_ARM64E_USERLAND24) ? fixupLoc->arm64e.authBind24.ordinal : fixupLoc->arm64e.authBind.ordinal;
+                        if ( bindOrdinal >= bindTargets.count() ) {
+                            diag.error("out of range bind ordinal %d (max %lu)", bindOrdinal, bindTargets.count());
+                            stop = true;
+                            break;
+                        }
+                        else {
+                            // authenticated bind
+                            newValue = (void*)(bindTargets[bindOrdinal]);
+                            if (newValue != 0)  // Don't sign missing weak imports
+                                newValue = (void*)fixupLoc->arm64e.signPointer(fixupLoc, (uintptr_t)newValue);
+                        }
+                    }
+                    else {
+                        // authenticated rebase
+                        newValue = (void*)fixupLoc->arm64e.signPointer(fixupLoc, (uintptr_t)this + fixupLoc->arm64e.authRebase.target);
+                    }
+                }
+                else {
+                    if ( fixupLoc->arm64e.bind.bind ) {
+                        uint32_t bindOrdinal = (segInfo->pointer_format == DYLD_CHAINED_PTR_ARM64E_USERLAND24) ? fixupLoc->arm64e.bind24.ordinal : fixupLoc->arm64e.bind.ordinal;
+                        if ( bindOrdinal >= bindTargets.count() ) {
+                            diag.error("out of range bind ordinal %d (max %lu)", bindOrdinal, bindTargets.count());
+                            stop = true;
+                            break;
+                        }
+                        else {
+                            // plain bind
+                            newValue = (void*)((long)bindTargets[bindOrdinal] + fixupLoc->arm64e.signExtendedAddend());
+                        }
+                    }
+                    else {
+                        // plain rebase (old format target is vmaddr, new format target is offset)
+                        if ( segInfo->pointer_format == DYLD_CHAINED_PTR_ARM64E )
+                            newValue = (void*)(fixupLoc->arm64e.unpackTarget()+slide);
+                        else
+                            newValue = (void*)((uintptr_t)this + fixupLoc->arm64e.unpackTarget());
+                   }
+                }
+                if ( logFixup )
+                    logFixup(fixupLoc, newValue);
+                fixupLoc->raw64 = (uintptr_t)newValue;
+                break;
+  #endif
+            case DYLD_CHAINED_PTR_64:
+            case DYLD_CHAINED_PTR_64_OFFSET:
+                if ( fixupLoc->generic64.bind.bind ) {
+                    if ( fixupLoc->generic64.bind.ordinal >= bindTargets.count() ) {
+                        diag.error("out of range bind ordinal %d (max %lu)", fixupLoc->generic64.bind.ordinal, bindTargets.count());
+                        stop = true;
+                        break;
+                    }
+                    else {
+                        newValue = (void*)((long)bindTargets[fixupLoc->generic64.bind.ordinal] + fixupLoc->generic64.signExtendedAddend());
+                    }
+                }
+                else {
+                    // plain rebase (old format target is vmaddr, new format target is offset)
+                    if ( segInfo->pointer_format == DYLD_CHAINED_PTR_64 )
+                        newValue = (void*)(fixupLoc->generic64.unpackedTarget()+slide);
+                    else
+                        newValue = (void*)((uintptr_t)this + fixupLoc->generic64.unpackedTarget());
+                }
+                if ( logFixup )
+                    logFixup(fixupLoc, newValue);
+                fixupLoc->raw64 = (uintptr_t)newValue;
+               break;
+#else
+            case DYLD_CHAINED_PTR_32:
+                if ( fixupLoc->generic32.bind.bind ) {
+                    if ( fixupLoc->generic32.bind.ordinal >= bindTargets.count() ) {
+                        diag.error("out of range bind ordinal %d (max %lu)", fixupLoc->generic32.bind.ordinal, bindTargets.count());
+                        stop = true;
+                        break;
+                    }
+                    else {
+                        newValue = (void*)((long)bindTargets[fixupLoc->generic32.bind.ordinal] + fixupLoc->generic32.bind.addend);
+                    }
+                }
+                else {
+                    if ( fixupLoc->generic32.rebase.target > segInfo->max_valid_pointer ) {
+                        // handle non-pointers in chain
+                        uint32_t bias = (0x04000000 + segInfo->max_valid_pointer)/2;
+                        newValue = (void*)(fixupLoc->generic32.rebase.target - bias);
+                    }
+                    else {
+                        newValue = (void*)(fixupLoc->generic32.rebase.target + slide);
+                    }
+                }
+                if ( logFixup )
+                    logFixup(fixupLoc, newValue);
+                fixupLoc->raw32 = (uint32_t)(uintptr_t)newValue;
+               break;
+#endif // __LP64__
+            default:
+                diag.error("unsupported pointer chain format: 0x%04X", segInfo->pointer_format);
+                stop = true;
+                break;
+        }
+    });
+}
+#endif
+
+
+bool MachOLoaded::walkChain(Diagnostics& diag, ChainedFixupPointerOnDisk* chain, uint16_t pointer_format, bool notifyNonPointers, uint32_t max_valid_pointer,
+                            void (^handler)(ChainedFixupPointerOnDisk* fixupLocation, bool& stop)) const
+{
+    const unsigned stride = ChainedFixupPointerOnDisk::strideSize(pointer_format);
+    bool  stop = false;
+    bool  chainEnd = false;
+    while (!stop && !chainEnd) {
+        // copy chain content, in case handler modifies location to final value
+        ChainedFixupPointerOnDisk chainContent = *chain;
+        handler(chain, stop);
+        if ( !stop ) {
+            switch (pointer_format) {
+                case DYLD_CHAINED_PTR_ARM64E:
+                case DYLD_CHAINED_PTR_ARM64E_KERNEL:
+                case DYLD_CHAINED_PTR_ARM64E_USERLAND:
+                case DYLD_CHAINED_PTR_ARM64E_USERLAND24:
+                case DYLD_CHAINED_PTR_ARM64E_FIRMWARE:
+                    if ( chainContent.arm64e.rebase.next == 0 )
+                        chainEnd = true;
+                    else
+                        chain = (ChainedFixupPointerOnDisk*)((uint8_t*)chain + chainContent.arm64e.rebase.next*stride);
+                    break;
+                case DYLD_CHAINED_PTR_64:
+                case DYLD_CHAINED_PTR_64_OFFSET:
+                    if ( chainContent.generic64.rebase.next == 0 )
+                        chainEnd = true;
+                    else
+                        chain = (ChainedFixupPointerOnDisk*)((uint8_t*)chain + chainContent.generic64.rebase.next*4);
+                    break;
+                case DYLD_CHAINED_PTR_32:
+                    if ( chainContent.generic32.rebase.next == 0 )
+                        chainEnd = true;
+                    else {
+                        chain = (ChainedFixupPointerOnDisk*)((uint8_t*)chain + chainContent.generic32.rebase.next*4);
+                        if ( !notifyNonPointers ) {
+                            while ( (chain->generic32.rebase.bind == 0) && (chain->generic32.rebase.target > max_valid_pointer) ) {
+                                // not a real pointer, but a non-pointer co-opted into chain
+                                chain = (ChainedFixupPointerOnDisk*)((uint8_t*)chain + chain->generic32.rebase.next*4);
+                            }
+                        }
+                    }
+                    break;
+                case DYLD_CHAINED_PTR_64_KERNEL_CACHE:
+                case DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE:
+                    if ( chainContent.kernel64.next == 0 )
+                        chainEnd = true;
+                    else
+                        chain = (ChainedFixupPointerOnDisk*)((uint8_t*)chain + chainContent.kernel64.next*stride);
+                    break;
+                case DYLD_CHAINED_PTR_32_FIRMWARE:
+                    if ( chainContent.firmware32.next == 0 )
+                        chainEnd = true;
+                    else
+                        chain = (ChainedFixupPointerOnDisk*)((uint8_t*)chain + chainContent.firmware32.next*4);
+                    break;
+                default:
+                    diag.error("unknown pointer format 0x%04X", pointer_format);
+                    stop = true;
+            }
+        }
+    }
+    return stop;
+}
+
+void MachOLoaded::forEachFixupChainSegment(Diagnostics& diag, const dyld_chained_starts_in_image* starts,
+                                           void (^handler)(const dyld_chained_starts_in_segment* segInfo, uint32_t segIndex, bool& stop)) const
+{
+    bool stopped = false;
+    for (uint32_t segIndex=0; segIndex < starts->seg_count && !stopped; ++segIndex) {
+        if ( starts->seg_info_offset[segIndex] == 0 )
+            continue;
+        const dyld_chained_starts_in_segment* segInfo = (dyld_chained_starts_in_segment*)((uint8_t*)starts + starts->seg_info_offset[segIndex]);
+        handler(segInfo, segIndex, stopped);
+    }
+}
+
+void MachOLoaded::forEachFixupInSegmentChains(Diagnostics& diag, const dyld_chained_starts_in_segment* segInfo, bool notifyNonPointers,
+                                              void (^handler)(ChainedFixupPointerOnDisk* fixupLocation, const dyld_chained_starts_in_segment* segInfo, bool& stop)) const
+{
+    auto adaptor = ^(ChainedFixupPointerOnDisk* fixupLocation, bool& stop) {
+         handler(fixupLocation, segInfo, stop);
+    };
+    bool stopped = false;
+    for (uint32_t pageIndex=0; pageIndex < segInfo->page_count && !stopped; ++pageIndex) {
+        uint16_t offsetInPage = segInfo->page_start[pageIndex];
+        if ( offsetInPage == DYLD_CHAINED_PTR_START_NONE )
+            continue;
+        if ( offsetInPage & DYLD_CHAINED_PTR_START_MULTI ) {
+            // 32-bit chains which may need multiple starts per page
+            uint32_t overflowIndex = offsetInPage & ~DYLD_CHAINED_PTR_START_MULTI;
+            bool chainEnd = false;
+            while (!stopped && !chainEnd) {
+                chainEnd = (segInfo->page_start[overflowIndex] & DYLD_CHAINED_PTR_START_LAST);
+                offsetInPage = (segInfo->page_start[overflowIndex] & ~DYLD_CHAINED_PTR_START_LAST);
+                uint8_t* pageContentStart = (uint8_t*)this + segInfo->segment_offset + (pageIndex * segInfo->page_size);
+                ChainedFixupPointerOnDisk* chain = (ChainedFixupPointerOnDisk*)(pageContentStart+offsetInPage);
+                stopped = walkChain(diag, chain, segInfo->pointer_format, notifyNonPointers, segInfo->max_valid_pointer, adaptor);
+                ++overflowIndex;
+            }
+        }
+        else {
+            // one chain per page
+            uint8_t* pageContentStart = (uint8_t*)this + segInfo->segment_offset + (pageIndex * segInfo->page_size);
+            ChainedFixupPointerOnDisk* chain = (ChainedFixupPointerOnDisk*)(pageContentStart+offsetInPage);
+            stopped = walkChain(diag, chain, segInfo->pointer_format, notifyNonPointers, segInfo->max_valid_pointer, adaptor);
+        }
+    }
+}
+
+void MachOLoaded::forEachFixupInAllChains(Diagnostics& diag, const dyld_chained_starts_in_image* starts, bool notifyNonPointers,
+                                          void (^handler)(ChainedFixupPointerOnDisk* fixupLocation, const dyld_chained_starts_in_segment* segInfo, bool& stop)) const
+{
+    bool stopped = false;
+    for (uint32_t segIndex=0; segIndex < starts->seg_count && !stopped; ++segIndex) {
+        if ( starts->seg_info_offset[segIndex] == 0 )
+            continue;
+        const dyld_chained_starts_in_segment* segInfo = (dyld_chained_starts_in_segment*)((uint8_t*)starts + starts->seg_info_offset[segIndex]);
+        forEachFixupInSegmentChains(diag, segInfo, notifyNonPointers, handler);
+    }
+}
+
+void MachOLoaded::forEachFixupInAllChains(Diagnostics& diag, uint16_t pointer_format, uint32_t starts_count, const uint32_t chain_starts[],
+                                          void (^handler)(ChainedFixupPointerOnDisk* fixupLocation, bool& stop)) const
+{
+    for (uint32_t i=0; i < starts_count; ++i) {
+        ChainedFixupPointerOnDisk* chain = (ChainedFixupPointerOnDisk*)((uint8_t*)this + chain_starts[i]);
+        if ( walkChain(diag, chain, pointer_format, false, 0, handler) )
+            break;
+    }
+}
 
 
 } // namespace dyld3

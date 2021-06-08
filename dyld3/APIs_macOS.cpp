@@ -33,11 +33,16 @@
 #include <fcntl.h>
 #include <TargetConditionals.h>
 #include <malloc/malloc.h>
+#include <mach-o/dyld_priv.h>
+#include <mach-o/dyld_images.h>
 
 #include <algorithm>
 
+#if __has_feature(ptrauth_calls)
+  #include <ptrauth.h>
+#endif
+
 #include "dlfcn.h"
-#include "dyld_priv.h"
 
 #include "AllImages.h"
 #include "Loading.h"
@@ -54,7 +59,7 @@ void                    parseDlHandle(void* h, const MachOLoaded** mh, bool* don
 
 
 // only in macOS and deprecated 
-#if __MAC_OS_X_VERSION_MIN_REQUIRED
+#if TARGET_OS_OSX
 
 // macOS needs to support an old API that only works with fileype==MH_BUNDLE.
 // In this deprecated API (unlike dlopen), loading and linking are separate steps.
@@ -69,7 +74,7 @@ NSObjectFileImageReturnCode NSCreateObjectFileImageFromFile(const char* path, NS
 
     // verify path exists
      struct stat statbuf;
-    if ( ::stat(path, &statbuf) == -1 )
+    if ( dyld3::stat(path, &statbuf) == -1 )
         return NSObjectFileImageFailure;
 
     // create ofi that just contains path. NSLinkModule does all the work
@@ -97,19 +102,13 @@ NSObjectFileImageReturnCode NSCreateObjectFileImageFromMemory(const void* memIma
     bool usable = false;
     const MachOFile* mf = (MachOFile*)memImage;
     if ( mf->hasMachOMagic() && mf->isMachO(diag, memImageSize) ) {
-        if ( strcmp(mf->archName(), MachOFile::currentArchName()) == 0 )
-            usable = true;
-#if __x86_64__
-        // <rdar://problem/42727628> support thin x86_64 on haswell machines
-        else if ( (strcmp(MachOFile::currentArchName(), "x86_64h") == 0) && (strcmp(mf->archName(), "x86_64") == 0) )
-            usable = true;
-#endif
+        usable = (gAllImages.archs().grade(mf->cputype, mf->cpusubtype, false) != 0);
     }
     else if ( const FatFile* ff = FatFile::isFatFile(memImage) ) {
         uint64_t sliceOffset;
         uint64_t sliceLen;
         bool     missingSlice;
-        if ( ff->isFatFileWithSlice(diag, memImageSize, MachOFile::currentArchName(), sliceOffset, sliceLen, missingSlice) ) {
+        if ( ff->isFatFileWithSlice(diag, memImageSize, gAllImages.archs(), false, sliceOffset, sliceLen, missingSlice) ) {
             mf = (MachOFile*)((long)memImage+sliceOffset);
             if ( mf->isMachO(diag, sliceLen) ) {
                 usable = true;
@@ -117,7 +116,7 @@ NSObjectFileImageReturnCode NSCreateObjectFileImageFromMemory(const void* memIma
         }
     }
     if ( usable ) {
-        if ( !mf->supportsPlatform(Platform::macOS) )
+        if ( !mf->builtForPlatform(Platform::macOS) )
             usable = false;
     }
     if ( !usable ) {
@@ -155,24 +154,27 @@ NSModule NSLinkModule(NSObjectFileImage ofi, const char* moduleName, uint32_t op
         // if this is memory based image, write to temp file, then use file based loading
         if ( image.memSource != nullptr ) {
             // make temp file with content of memory buffer
-            bool successfullyWritten = false;
-            image.path = ::tempnam(nullptr, "NSCreateObjectFileImageFromMemory-");
-            if ( image.path != nullptr ) {
-                int fd = ::open(image.path, O_WRONLY | O_CREAT | O_EXCL, 0644);
-                if ( fd != -1 ) {
-                    ssize_t writtenSize = ::pwrite(fd, image.memSource, image.memLength, 0);
-                    if ( writtenSize == image.memLength )
-                        successfullyWritten = true;
-                    ::close(fd);
-                }
+            image.path = nullptr;
+            char tempFileName[PATH_MAX];
+            const char* tmpDir = getenv("TMPDIR");
+            if ( (tmpDir != nullptr) && (strlen(tmpDir) > 2) ) {
+                strlcpy(tempFileName, tmpDir, PATH_MAX);
+                if ( tmpDir[strlen(tmpDir)-1] != '/' )
+                    strlcat(tempFileName, "/", PATH_MAX);
             }
-            if ( !successfullyWritten ) {
-                if ( image.path != nullptr ) {
-                    free((void*)image.path);
-                    image.path = nullptr;
+            else
+                strlcpy(tempFileName,"/tmp/", PATH_MAX);
+            strlcat(tempFileName, "NSCreateObjectFileImageFromMemory-XXXXXXXX", PATH_MAX);
+            int fd = ::mkstemp(tempFileName);
+            if ( fd != -1 ) {
+                ssize_t writtenSize = ::pwrite(fd, image.memSource, image.memLength, 0);
+                if ( writtenSize == image.memLength ) {
+                    image.path = strdup(tempFileName);
                 }
-                log_apis("NSLinkModule() => NULL (could not save memory image to temp file)\n");
-                return;
+                else {
+                    log_apis("NSLinkModule() => NULL (could not save memory image to temp file)\n");
+                }
+                ::close(fd);
             }
         }
         path = image.path;
@@ -190,7 +192,7 @@ NSModule NSLinkModule(NSObjectFileImage ofi, const char* moduleName, uint32_t op
     // dlopen the binary outside of the read lock as we don't want to risk deadlock
     Diagnostics diag;
     void* callerAddress = __builtin_return_address(1); // note layers: 1: real client, 0: libSystem glue
-    const MachOLoaded* loadAddress = gAllImages.dlopen(diag, path, false, false, false, true, callerAddress);
+    const MachOLoaded* loadAddress = gAllImages.dlopen(diag, path, false, false, false, false, true, callerAddress);
     if ( diag.hasError() ) {
         log_apis("   NSLinkModule: failed: %s\n", diag.errorMessage());
         return nullptr;
@@ -345,10 +347,15 @@ const char* NSLibraryNameForModule(NSModule m)
 
 static bool flatFindSymbol(const char* symbolName, void** symbolAddress, const mach_header** foundInImageAtLoadAddress)
 {
+    // <rdar://problem/59265987> allow flat lookup to find "_memcpy" even though it is not implemented as that name in any dylib
+    MachOLoaded::DependentToMachOLoaded finder = ^(const MachOLoaded* mh, uint32_t depIndex) {
+        return gAllImages.findDependent(mh, depIndex);
+    };
+
     __block bool result = false;
     gAllImages.forEachImage(^(const LoadedImage& loadedImage, bool& stop) {
         bool resultPointsToInstructions = false;
-        if ( loadedImage.loadedAddress()->hasExportedSymbol(symbolName, nullptr, symbolAddress, &resultPointsToInstructions) ) {
+        if ( loadedImage.loadedAddress()->hasExportedSymbol(symbolName, finder, symbolAddress, &resultPointsToInstructions) ) {
             *foundInImageAtLoadAddress = loadedImage.loadedAddress();
             stop = true;
             result = true;
@@ -448,8 +455,35 @@ void* NSAddressOfSymbol(NSSymbol symbol)
 {
     log_apis("NSAddressOfSymbol(%p)\n", symbol);
 
+	if ( symbol == nullptr )
+		return nullptr;
+
     // in dyld 1.0, NSSymbol was a pointer to the nlist entry in the symbol table
-    return (void*)symbol;
+    void *result = (void*)symbol;
+
+#if __has_feature(ptrauth_calls)
+    __block const MachOLoaded *module = nullptr;
+    gAllImages.infoForImageMappedAt(symbol, ^(const LoadedImage& foundImage, uint8_t permissions) {
+        module = foundImage.loadedAddress();
+    });
+
+    int64_t slide = module->getSlide();
+    __block bool resultPointsToInstructions = false;
+    module->forEachSection(^(const MachOAnalyzer::SectionInfo& sectInfo, bool malformedSectionRange, bool& stop) {
+        uint64_t sectStartAddr = sectInfo.sectAddr + slide;
+        uint64_t sectEndAddr = sectStartAddr + sectInfo.sectSize;
+        if ( ((uint64_t)result >= sectStartAddr) && ((uint64_t)result < sectEndAddr) ) {
+            resultPointsToInstructions = (sectInfo.sectFlags & S_ATTR_PURE_INSTRUCTIONS) || (sectInfo.sectFlags & S_ATTR_SOME_INSTRUCTIONS);
+            stop = true;
+        }
+    });
+
+    if (resultPointsToInstructions) {
+        result = __builtin_ptrauth_sign_unauthenticated(result, ptrauth_key_asia, 0);
+    }
+#endif
+
+    return result;
 }
 
 NSModule NSModuleForSymbol(NSSymbol symbol)

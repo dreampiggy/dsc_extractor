@@ -21,6 +21,7 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 
+#include <iostream>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -41,6 +42,7 @@
 #include <dirent.h>
 #include <mach/mach.h>
 #include <mach/machine.h>
+#include <mach/mach_time.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach-o/fat.h>
@@ -85,20 +87,19 @@ void Diagnostics::error(const char* format, ...)
 
 void Diagnostics::error(const char* format, va_list list)
 {
+    //FIXME: this should be assertNoError(), but we currently overwrite some errors
+    //assertNoError();
     _buffer = _simple_salloc();
     _simple_vsprintf(_buffer, format, list);
 
 #if BUILDING_CACHE_BUILDER
     if ( !_verbose )
         return;
-    
-    char *output_string;
-    vasprintf(&output_string, format, list);
-    
+
     if (_prefix.empty()) {
-        fprintf(stderr, "%s", output_string);
+        fprintf(stderr, "%s\n", _simple_string(_buffer));
     } else {
-        fprintf(stderr, "[%s] %s", _prefix.c_str(), output_string);
+        fprintf(stderr, "[%s] %s\n", _prefix.c_str(), _simple_string(_buffer));
     }
 #endif
 }
@@ -125,6 +126,14 @@ void Diagnostics::assertNoError() const
     if ( _buffer != nullptr )
         abort_report_np("%s", _simple_string(_buffer));
 }
+
+bool Diagnostics::errorMessageContains(const char* subString) const
+{
+    if ( _buffer == nullptr )
+        return false;
+    return (strstr(_simple_string(_buffer), subString) != nullptr);
+}
+
 
 #if !BUILDING_CACHE_BUILDER
 const char* Diagnostics::errorMessage() const
@@ -166,6 +175,7 @@ void Diagnostics::verbose(const char* format, ...)
     } else {
         fprintf(stderr, "[%s] %s", _prefix.c_str(), output_string);
     }
+    free(output_string);
 }
 
 const std::string Diagnostics::prefix() const
@@ -186,7 +196,7 @@ std::string Diagnostics::errorMessage() const
     if ( _buffer != nullptr )
         return _simple_string(_buffer);
     else
-        return std::string();
+        return "";
 }
 
 const std::set<std::string> Diagnostics::warnings() const
@@ -212,6 +222,54 @@ void Diagnostics::clearWarnings()
     _warnings.clear();
 #endif
 }
+
+#if BUILDING_CACHE_BUILDER
+void TimeRecorder::pushTimedSection() {
+    openTimings.push_back(mach_absolute_time());
+}
+
+void TimeRecorder::recordTime(const char* format, ...) {
+    uint64_t t = mach_absolute_time();
+    uint64_t previousTime = openTimings.back();
+    openTimings.pop_back();
+
+    char*   output_string = nullptr;
+    va_list list;
+    va_start(list, format);
+    vasprintf(&output_string, format, list);
+    va_end(list);
+
+    if (output_string != nullptr) {
+        timings.push_back(TimingEntry {
+            .time = t - previousTime,
+            .logMessage = std::string(output_string),
+            .depth = (int)openTimings.size()
+        });
+    }
+
+    openTimings.push_back(mach_absolute_time());
+}
+
+void TimeRecorder::popTimedSection() {
+    openTimings.pop_back();
+}
+
+static inline uint32_t absolutetime_to_milliseconds(uint64_t abstime)
+{
+    return (uint32_t)(abstime/1000/1000);
+}
+
+void TimeRecorder::logTimings() {
+    for (const TimingEntry& entry : timings) {
+        for (int i = 0 ; i < entry.depth ; i++) {
+            std::cerr << "  ";
+        }
+        std::cerr << "time to " << entry.logMessage << " " << absolutetime_to_milliseconds(entry.time) << "ms" << std::endl;
+    }
+
+    timings.clear();
+}
+#endif
 
 #endif
 

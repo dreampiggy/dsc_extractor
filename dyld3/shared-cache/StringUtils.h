@@ -67,7 +67,22 @@ inline void bytesToHex(const uint8_t* bytes, size_t byteCount, char buffer[])
     *p++ =  '\0';
 }
 
-inline uint8_t hexCharToUInt(const char hexByte, uint8_t& value) {
+inline void putHexNibble(uint8_t value, char*& p)
+{
+    if ( value < 10 )
+        *p++ = '0' + value;
+    else
+        *p++ = 'A' + value - 10;
+}
+
+inline void putHexByte(uint8_t value, char*& p)
+{
+    value &= 0xFF;
+    putHexNibble(value >> 4,   p);
+    putHexNibble(value & 0x0F, p);
+}
+
+inline bool hexCharToUInt(const char hexByte, uint8_t& value) {
     if (hexByte >= '0' && hexByte <= '9') {
         value = hexByte - '0';
         return true;
@@ -83,6 +98,10 @@ inline uint8_t hexCharToUInt(const char hexByte, uint8_t& value) {
 }
 
 inline uint64_t hexToUInt64(const char* startHexByte, const char** endHexByte) {
+    const char* scratch;
+    if (endHexByte == nullptr) {
+        endHexByte = &scratch;
+    }
     if (startHexByte == nullptr)
         return 0;
     uint64_t retval = 0;
@@ -103,20 +122,21 @@ inline uint64_t hexToUInt64(const char* startHexByte, const char** endHexByte) {
     return retval;
 }
 
-inline bool hexToBytes(const char* startHexByte, uint32_t length, uint8_t buffer[]) {
-    if (startHexByte == nullptr)
-        return false;
-    const char *currentHexByte = startHexByte;
-    for (uint32_t i = 0; i < length; ++i) {
-        uint8_t value;
-        if (!hexCharToUInt(currentHexByte[i], value)) {
+inline bool hexStringToBytes(const char* hexString, uint8_t buffer[], unsigned bufferMaxSize, unsigned& bufferLenUsed)
+{
+    bufferLenUsed = 0;
+    bool high = true;
+    for (const char* s=hexString; *s != '\0'; ++s) {
+        if ( bufferLenUsed > bufferMaxSize )
             return false;
-        }
-        if (i%2 == 0) {
-            buffer[i/2] = value << 4;
-        } else {
-            buffer[(i-1)/2] |= value;
-        }
+        uint8_t value;
+        if ( !hexCharToUInt(*s, value) )
+            return false;
+        if ( high )
+            buffer[bufferLenUsed] = value << 4;
+        else
+            buffer[bufferLenUsed++] |= value;
+        high = !high;
     }
     return true;
 }

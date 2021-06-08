@@ -83,7 +83,8 @@ public:
 	virtual bool						isExecutable() const { unreachable();  }
 	virtual bool						isPositionIndependentExecutable() const { unreachable();  }
 	virtual bool						forceFlat() const { unreachable();  }
-	virtual uintptr_t					doBindLazySymbol(uintptr_t* lazyPointer, const LinkContext& context) { unreachable(); }
+	virtual uintptr_t					doBindLazySymbol(uintptr_t* lazyPointer, const LinkContext& context,
+														 DyldSharedCache::DataConstLazyScopedWriter& patcher) { unreachable(); }
 	virtual uintptr_t					doBindFastLazySymbol(uint32_t lazyBindingInfoOffset, const LinkContext& context,
 															void (*lock)(), void (*unlock)()) { unreachable(); }
 	virtual void						doTermination(const LinkContext& context) { unreachable(); }
@@ -144,6 +145,8 @@ public:
 
 protected:
 	virtual void						setDyldInfo(const dyld_info_command* dyldInfo) { unreachable(); }
+	virtual void						setChainedFixups(const linkedit_data_command* fixups) { unreachable(); }
+	virtual void						setExportsTrie(const linkedit_data_command*) { unreachable(); }
 	virtual void						setSymbolTableInfo(const macho_nlist*, const char*, const dysymtab_command*) { unreachable(); }
 	virtual uint32_t*					segmentCommandOffsets() const { unreachable(); }
 	virtual	void						rebase(const LinkContext& context, uintptr_t slide) { unreachable(); }
@@ -160,10 +163,11 @@ protected:
 #endif
 
 	virtual void						recursiveLoadLibraries(const LinkContext& context, bool preflightOnly, const RPathChain& loaderRPaths, const char* loadPath);
-	virtual unsigned 					recursiveUpdateDepth(unsigned int maxDepth);
+	virtual unsigned 					updateDepth(unsigned int maxDepth);
 	virtual void						recursiveRebase(const LinkContext& context) {  }
-	virtual void						recursiveBind(const LinkContext& context, bool forceLazysBound, bool neverUnload);
+	virtual void						recursiveBind(const LinkContext& context, bool forceLazysBound, bool neverUnload, const ImageLoader* parent);
 	virtual void						recursiveApplyInterposing(const LinkContext& context);
+	virtual void						recursiveMakeDataReadOnly(const LinkContext& context) {}
 	virtual void						recursiveGetDOFSections(const LinkContext& context, std::vector<DOFInfo>& dofs) { }
 	virtual void						recursiveInitialization(const LinkContext& context, mach_port_t this_thread, const char* pathToInitialize,
 																ImageLoader::InitializerTimingList&, ImageLoader::UninitedUpwards&);
@@ -171,8 +175,8 @@ protected:
 	virtual void						doGetDependentLibraries(DependentLibraryInfo libs[]) { unreachable(); }
 	virtual LibraryInfo					doGetLibraryInfo(const LibraryInfo& requestorInfo) { return requestorInfo; }
 	virtual void						doRebase(const LinkContext& context) { unreachable(); }
-	virtual void						doBind(const LinkContext& context, bool forceLazysBound) { unreachable(); }
-	virtual void						doBindJustLazies(const LinkContext& context) { unreachable(); }
+	virtual void						doBind(const LinkContext& context, bool forceLazysBound, const ImageLoader* reExportParent) { unreachable(); }
+	virtual void						doBindJustLazies(const LinkContext& context, DyldSharedCache::DataConstLazyScopedWriter& patcher) { unreachable(); }
 	virtual void						doGetDOFSections(const LinkContext& context, std::vector<DOFInfo>& dofs) { unreachable(); }
 	virtual void						doInterpose(const LinkContext& context) { unreachable(); }
 	virtual bool						doInitialization(const LinkContext& context) { unreachable(); }
@@ -183,7 +187,7 @@ protected:
 			bool						allDependentLibrariesAsWhenPreBound() const { unreachable(); }
 	virtual	bool						isSubframeworkOf(const LinkContext& context, const ImageLoader* image) const { return false; }
 	virtual	bool						hasSubLibrary(const LinkContext& context, const ImageLoader* child) const { return false; }
-	virtual bool						weakSymbolsBound(unsigned index);
+	virtual bool						weakSymbolsBound(unsigned index) const;
 	virtual void						setWeakSymbolsBound(unsigned index);
 
 private:

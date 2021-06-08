@@ -22,8 +22,9 @@
  */
 
 #include <stdarg.h>
+#include <mach-o/dyld_priv.h>
+#include <mach-o/dyld_images.h>
 
-#include "dyld_priv.h"
 #include "libdyldEntryVector.h"
 #include "AllImages.h"
 #include "Array.h"
@@ -37,7 +38,8 @@ extern "C" char start;
 
 VIS_HIDDEN const char** appleParams;
 
-extern bool gUseDyld3;
+extern void* __ptrauth_dyld_address_auth gUseDyld3;
+extern bool gEnableSharedCacheDataConst;
 
 namespace dyld3 {
 
@@ -56,7 +58,8 @@ static const char* leafName(const char* argv0)
         return argv0;
 }
 
-static void entry_setVars(const mach_header* mainMH, int argc, const char* argv[], const char* envp[], const char* apple[])
+static void entry_setVars(const mach_header* mainMH, int argc, const char* argv[], const char* envp[], const char* apple[],
+                          bool keysOff, bool platformBinariesOnly, bool enableSharedCacheDataConst)
 {
     NXArgc       = argc;
     NXArgv       = argv;
@@ -69,11 +72,13 @@ static void entry_setVars(const mach_header* mainMH, int argc, const char* argv[
     sVars.NXArgvPtr     = &NXArgv;
     sVars.environPtr    = (const char***)&environ;
     sVars.__prognamePtr = &__progname;
-    gAllImages.setProgramVars(&sVars);
+    gAllImages.setProgramVars(&sVars, keysOff, platformBinariesOnly);
 
-    gUseDyld3 = true;
+    gUseDyld3 = (void*)1;
 
     setLoggingFromEnvs(envp);
+
+    gEnableSharedCacheDataConst = enableSharedCacheDataConst;
 }
 
 static void entry_setHaltFunction(void (*func)(const char* message) __attribute__((noreturn)) )
@@ -92,25 +97,26 @@ static void entry_setOldAllImageInfo(dyld_all_image_infos* old)
 }
 
 static void entry_setNotifyMonitoringDyldMain(void (*notifyMonitoringDyldMain)()) {
+#if !TARGET_OS_DRIVERKIT
     setNotifyMonitoringDyldMain(notifyMonitoringDyldMain);
+#endif
 }
 
 static void entry_setNotifyMonitoringDyld(void (*notifyMonitoringDyld)(bool unloading,unsigned imageCount,
                                                                                const struct mach_header* loadAddresses[],
                                                                                const char* imagePaths[])) {
+#if !TARGET_OS_DRIVERKIT
     setNotifyMonitoringDyld(notifyMonitoringDyld);
+#endif
 }
 
 static void entry_setInitialImageList(const closure::LaunchClosure* closure,
-                                const DyldSharedCache* dyldCacheLoadAddress, const char* dyldCachePath,
-                                const Array<LoadedImage>& initialImages, const LoadedImage& libSystem)
+                                      const DyldSharedCache* dyldCacheLoadAddress, const char* dyldCachePath,
+                                      const Array<LoadedImage>& initialImages, LoadedImage& libSystem,
+                                      mach_port_t mach_task_self)
 {
     gAllImages.init(closure, dyldCacheLoadAddress, dyldCachePath, initialImages);
-    gAllImages.applyInterposingToDyldCache(closure);
-
-    const char* mainPath = _simple_getenv(appleParams, "executable_path");
-    if ( (mainPath != nullptr) && (mainPath[0] == '/') )
-        gAllImages.setMainPath(mainPath);
+    gAllImages.applyInterposingToDyldCache(closure, mach_task_self);
 
     // run initializer for libSytem.B.dylib
     // this calls back into _dyld_initializer which calls gAllIimages.addImages()
@@ -123,7 +129,9 @@ static void entry_setInitialImageList(const closure::LaunchClosure* closure,
 static void entry_runInitialzersBottomUp(const mach_header* mainExecutableImageLoadAddress)
 {
     gAllImages.runStartupInitialzers();
+#if !TARGET_OS_DRIVERKIT
     gAllImages.notifyMonitorMain();
+#endif
 }
 
 static void entry_setChildForkFunction(void (*func)() )
@@ -131,10 +139,38 @@ static void entry_setChildForkFunction(void (*func)() )
     sChildForkFunction = func;
 }
 
-static void entry_setRestrictions(bool allowAtPaths, bool allowEnvPaths)
+static void entry_setRestrictions(bool allowAtPaths, bool allowEnvPaths, bool allowFallbackPaths)
 {
     gAllImages.setRestrictions(allowAtPaths, allowEnvPaths);
+    closure::gPathOverrides.setFallbackPathHandling(allowFallbackPaths ?
+                                                    dyld3::closure::PathOverrides::FallbackPathMode::classic :
+                                                    dyld3::closure::PathOverrides::FallbackPathMode::restricted);
 }
+
+static void entry_setHasCacheOverrides(bool someCacheImageOverriden)
+{
+    gAllImages.setHasCacheOverrides(someCacheImageOverriden);
+}
+
+
+static void entry_setProgramVars(ProgramVars* progVars)
+{
+    // this entry only called when running crt1.o based old macOS programs
+    gAllImages.setProgramVars((AllImages::ProgramVars*)progVars, false, false);
+}
+
+static void entry_setLaunchMode(uint32_t flags)
+{
+    gAllImages.setLaunchMode(flags);
+}
+
+static MainFunc entry_getDriverkitMain(void)
+{
+    return gAllImages.getDriverkitMain();
+}
+
+
+static_assert((closure::kFormatVersion & LibDyldEntryVector::kBinaryFormatVersionMask) == closure::kFormatVersion, "binary format version overflow");
 
 const LibDyldEntryVector entryVectorForDyld = {
     LibDyldEntryVector::kCurrentVectorVersion,
@@ -149,12 +185,30 @@ const LibDyldEntryVector entryVectorForDyld = {
     &entry_setLogFunction,
     &entry_setRestrictions,
     &entry_setNotifyMonitoringDyldMain,
-    &entry_setNotifyMonitoringDyld
+    &entry_setNotifyMonitoringDyld,
+    &entry_setHasCacheOverrides,
+    &entry_setProgramVars,
+    &entry_setLaunchMode,
+    &entry_getDriverkitMain,
 };
+
+VIS_HIDDEN void _dyld_atfork_prepare()
+{
+    gAllImages.takeLockBeforeFork();
+}
+
+VIS_HIDDEN void _dyld_atfork_parent()
+{
+    gAllImages.releaseLockInForkParent();
+}
 
 VIS_HIDDEN void _dyld_fork_child()
 {
+    // Note the child fork function updates the data structures inside dyld
     (*sChildForkFunction)();
+
+    // And we then need to update the structures for dyld3 in libdyld
+    gAllImages.resetLockInForkChild();
 }
 
 
